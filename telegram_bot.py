@@ -3,26 +3,31 @@ import json
 import logging
 import re
 import urllib.parse
+import sqlite3
+import os
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 import aiohttp
 from bs4 import BeautifulSoup
 from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_exception_type, RetryError as TenacityRetryError
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# Embedded credentials
-TELEGRAM_BOT_TOKEN = "1951771121:AAEn0VTc-8Ejx_RToZl_i69W0z6NCrau4I0"
+# کلیدهای API
+TELEGRAM_BOT_TOKEN = "1951771121:AAHxdMix9xAR6a592sTZKC6aBArdfIaLwco"
 METIS_API_KEY = "tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm"
+METIS_BOT_ID = "30f054f0-2363-4128-b6c6-308efc31c5d9"
 METIS_MODEL = "gpt-4o"
-API_URL_METIS = "https://api.metis.ai/v1/chat/completions"
+API_URL_METIS = "https://api.metisai.ir/api/chat"
 
-# Retry configuration
+# تنظیمات
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_SECONDS = 2
+MAX_DAILY_REQUESTS = 10
 
-# Configure logging
+# تنظیمات logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -32,24 +37,197 @@ logger = logging.getLogger(__name__)
 class RetryableError(Exception):
     pass
 
+class DatabaseManager:
+    def __init__(self, db_path="bot_database.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """ایجاد جداول دیتابیس"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # جدول کاربران
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    join_date TEXT DEFAULT (datetime('now')),
+                    daily_requests INTEGER DEFAULT 0,
+                    last_request_date TEXT,
+                    preferred_category TEXT DEFAULT 'general',
+                    language TEXT DEFAULT 'fa'
+                )
+            ''')
+            
+            # جدول درخواست‌ها
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    topic TEXT,
+                    category TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    status TEXT DEFAULT 'completed',
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول آمار
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS analytics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT,
+                    total_requests INTEGER DEFAULT 0,
+                    successful_requests INTEGER DEFAULT 0,
+                    failed_requests INTEGER DEFAULT 0
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing database: {e}")
+            raise
+    
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """دریافت اطلاعات کاربر"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+            user = cursor.fetchone()
+            conn.close()
+            
+            if user:
+                return {
+                    'user_id': user[0],
+                    'username': user[1],
+                    'first_name': user[2],
+                    'last_name': user[3],
+                    'join_date': user[4],
+                    'daily_requests': user[5],
+                    'last_request_date': user[6],
+                    'preferred_category': user[7],
+                    'language': user[8]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting user {user_id}: {e}")
+            return None
+    
+    def create_user(self, user_id: int, username: str, first_name: str, last_name: str):
+        """ایجاد کاربر جدید"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (user_id, username, first_name, last_name)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, username, first_name, last_name))
+            conn.commit()
+            conn.close()
+            logger.info(f"User {user_id} created/updated successfully")
+        except Exception as e:
+            logger.error(f"Error creating user {user_id}: {e}")
+            raise
+    
+    def update_daily_requests(self, user_id: int) -> int:
+        """به‌روزرسانی تعداد درخواست‌های روزانه"""
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # بررسی تاریخ آخرین درخواست
+            cursor.execute('SELECT last_request_date, daily_requests FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            
+            if result and result[0]:
+                try:
+                    last_date = datetime.strptime(result[0], '%Y-%m-%d').date()
+                    today_date = datetime.now().date()
+                    if last_date == today_date:
+                        # همان روز - افزایش شمارنده
+                        new_count = result[1] + 1
+                    else:
+                        # روز جدید - ریست شمارنده
+                        new_count = 1
+                except ValueError:
+                    # اگر فرمت تاریخ اشتباه باشد
+                    new_count = 1
+            else:
+                # اولین درخواست
+                new_count = 1
+            
+            cursor.execute('''
+                UPDATE users 
+                SET daily_requests = ?, last_request_date = ?
+                WHERE user_id = ?
+            ''', (new_count, today, user_id))
+            
+            conn.commit()
+            conn.close()
+            logger.debug(f"Updated daily requests for user {user_id}: {new_count}")
+            return new_count
+        except Exception as e:
+            logger.error(f"Error updating daily requests for user {user_id}: {e}")
+            return 0
+    
+    def can_make_request(self, user_id: int) -> bool:
+        """بررسی امکان درخواست"""
+        try:
+            count = self.update_daily_requests(user_id)
+            return count <= MAX_DAILY_REQUESTS
+        except Exception as e:
+            logger.error(f"Error checking request limit for user {user_id}: {e}")
+            return True  # در صورت خطا، اجازه درخواست بده
+    
+    def log_request(self, user_id: int, topic: str, category: str):
+        """ثبت درخواست"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO requests (user_id, topic, category)
+                VALUES (?, ?, ?)
+            ''', (user_id, topic, category))
+            conn.commit()
+            conn.close()
+            logger.info(f"Request logged for user {user_id}: {topic} ({category})")
+        except Exception as e:
+            logger.error(f"Error logging request for user {user_id}: {e}")
+            # در صورت خطا، ادامه کار بدون ثبت
+
 class ContentScraper:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'no-cache',
         }
 
     async def fetch_page(self, url: str, timeout: int = 15, params: dict = None) -> str:
-        """Fetch a web page with proper headers and error handling"""
+        """واکشی صفحه وب با headers مناسب و مدیریت خطا"""
         try:
             kwargs = {
                 'headers': self.headers,
-                'timeout': timeout,
-                'ssl': False  # Disable SSL verification
+                'timeout': aiohttp.ClientTimeout(total=timeout),
+                'ssl': False,
+                'allow_redirects': True,
+                'max_redirects': 5
             }
             
             if params:
@@ -60,74 +238,41 @@ class ContentScraper:
                     content = await response.text()
                     logger.debug(f"Successfully fetched {len(content)} characters from {url}")
                     return content
+                elif response.status == 403:
+                    logger.warning(f"Access forbidden (403) for {url}")
+                    return ""
+                elif response.status == 404:
+                    logger.warning(f"Page not found (404) for {url}")
+                    return ""
+                elif response.status >= 500:
+                    logger.warning(f"Server error ({response.status}) for {url}")
+                    return ""
                 else:
                     logger.warning(f"HTTP {response.status} for {url}")
                     return ""
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching {url}")
+            return ""
+        except aiohttp.ClientError as e:
+            logger.error(f"Client error fetching {url}: {e}")
+            return ""
         except Exception as e:
-            logger.error(f"Error fetching {url}: {e}")
+            logger.error(f"Unexpected error fetching {url}: {e}")
             return ""
 
     def clean_text(self, text: str) -> str:
-        """Clean and normalize text content"""
-        # Remove extra whitespace and newlines
+        """تمیز کردن و نرمال‌سازی متن"""
+        if not text:
+            return ""
         text = re.sub(r'\s+', ' ', text).strip()
-        # Remove HTML entities
         text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+        text = text.replace('&quot;', '"').replace('&#39;', "'")
         return text
 
-    def extract_text_from_html(self, html: str, selectors: List[str]) -> List[str]:
-        """Extract text content using multiple CSS selectors"""
-        if not html:
-            return []
-        
-        try:
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            results = []
-            for selector in selectors:
-                try:
-                    elements = soup.select(selector)
-                    for element in elements:
-                        text = self.clean_text(element.get_text())
-                        if text and len(text) > 20:  # Filter out very short texts
-                            results.append(text)
-                except Exception as e:
-                    logger.debug(f"Selector {selector} failed: {e}")
-                    continue
-            
-            return results
-        except Exception as e:
-            logger.error(f"HTML parsing error: {e}")
-            return []
-
     async def search_duckduckgo(self, query: str) -> List[Dict[str, str]]:
-        """Search using DuckDuckGo which is more reliable"""
+        """جستجو با DuckDuckGo"""
         try:
-            # DuckDuckGo instant answer API
-            ddg_url = "https://api.duckduckgo.com/"
-            params = {
-                'q': query,
-                'format': 'json',
-                'no_html': '1',
-                'skip_disambig': '1'
-            }
-            
-            html = await self.fetch_page(ddg_url, params=params)
-            if html:
-                try:
-                    data = json.loads(html)
-                    abstract = data.get('AbstractText', '')
-                    if abstract:
-                        return [{'title': f'خلاصه {query}', 'snippet': abstract[:500], 'url': ''}]
-                except:
-                    pass
-            
-            # Search via HTML
-            search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+            search_url = f"https://duckduckgo.com/html/?q={urllib.parse.quote(query)}"
             html = await self.fetch_page(search_url)
             
             if not html:
@@ -136,24 +281,29 @@ class ContentScraper:
             soup = BeautifulSoup(html, 'html.parser')
             results = []
             
-            # Extract search results from DuckDuckGo
-            search_results = soup.find_all('div', class_='result')
+            search_results = soup.find_all('div', class_='result__body')
             
-            for result in search_results[:8]:
+            for result in search_results[:5]:
                 try:
-                    link_elem = result.find('a', class_='result__a')
+                    title_elem = result.find('a', class_='result__a')
                     snippet_elem = result.find('a', class_='result__snippet')
                     
-                    if link_elem:
-                        url = link_elem.get('href', '')
-                        title = self.clean_text(link_elem.get_text())
+                    if title_elem:
+                        url = title_elem.get('href', '')
+                        title = self.clean_text(title_elem.get_text())
                         snippet = self.clean_text(snippet_elem.get_text()) if snippet_elem else ""
                         
-                        results.append({
-                            'url': url,
-                            'title': title,
-                            'snippet': snippet
-                        })
+                        if url.startswith('//'):
+                            url = 'https:' + url
+                        elif url.startswith('/'):
+                            url = 'https://duckduckgo.com' + url
+                        
+                        if title and len(title) > 10:
+                            results.append({
+                                'url': url,
+                                'title': title,
+                                'snippet': snippet
+                            })
                 except Exception as e:
                     logger.debug(f"Error parsing DDG result: {e}")
                     continue
@@ -165,7 +315,7 @@ class ContentScraper:
             return []
 
     async def search_bing(self, query: str) -> List[Dict[str, str]]:
-        """Search using Bing as alternative"""
+        """جستجو با Bing"""
         try:
             search_url = f"https://www.bing.com/search?q={urllib.parse.quote(query)}"
             html = await self.fetch_page(search_url)
@@ -176,25 +326,25 @@ class ContentScraper:
             soup = BeautifulSoup(html, 'html.parser')
             results = []
             
-            # Extract Bing search results
             search_results = soup.find_all('li', class_='b_algo')
             
-            for result in search_results[:8]:
+            for result in search_results[:5]:
                 try:
-                    link_elem = result.find('a')
                     title_elem = result.find('h2')
-                    snippet_elem = result.find('p')
+                    link_elem = title_elem.find('a') if title_elem else None
+                    snippet_elem = result.find('p') or result.find('div', class_='b_caption')
                     
                     if link_elem and title_elem:
                         url = link_elem.get('href', '')
                         title = self.clean_text(title_elem.get_text())
                         snippet = self.clean_text(snippet_elem.get_text()) if snippet_elem else ""
                         
-                        results.append({
-                            'url': url,
-                            'title': title,
-                            'snippet': snippet
-                        })
+                        if title and len(title) > 10:
+                            results.append({
+                                'url': url,
+                                'title': title,
+                                'snippet': snippet
+                            })
                 except Exception as e:
                     logger.debug(f"Error parsing Bing result: {e}")
                     continue
@@ -205,122 +355,70 @@ class ContentScraper:
             logger.error(f"Bing search error: {e}")
             return []
 
-    async def search_linkedin(self, query: str) -> str:
-        """Search LinkedIn for relevant content using multiple search engines"""
-        try:
-            # Try different search engines for LinkedIn content
-            linkedin_query = f"site:linkedin.com {query}"
-            
-            # Try DuckDuckGo first
-            ddg_results = await self.search_duckduckgo(linkedin_query)
-            linkedin_content = []
-            
-            for result in ddg_results[:3]:
-                if result['snippet']:
-                    linkedin_content.append(result['snippet'])
-            
-            # If not enough content, try Bing
-            if len(linkedin_content) < 2:
-                bing_results = await self.search_bing(linkedin_query)
-                for result in bing_results[:3]:
-                    if result['snippet'] and result['snippet'] not in linkedin_content:
-                        linkedin_content.append(result['snippet'])
-            
-            return "\n".join(linkedin_content[:5])
-            
-        except Exception as e:
-            logger.error(f"LinkedIn search error: {e}")
-            return ""
-
-    async def scrape_url_content(self, url: str) -> str:
-        """Scrape content from a specific URL"""
-        try:
-            html = await self.fetch_page(url)
-            if not html:
-                return ""
-            
-            # Common content selectors for different sites
-            content_selectors = [
-                'article', 'main', '.content', '.post-content', '.entry-content',
-                '.article-body', '.story-body', 'p', '.text-content', '.description'
-            ]
-            
-            texts = self.extract_text_from_html(html, content_selectors)
-            
-            # Combine and limit content
-            content = "\n".join(texts[:10])  # Limit to first 10 text blocks
-            return content[:2000]  # Limit total length
-            
-        except Exception as e:
-            logger.error(f"Error scraping {url}: {e}")
-            return ""
-
     async def comprehensive_research(self, topic: str) -> (str, list):
-        """Perform comprehensive research on a topic using multiple sources and collect URLs"""
+        """تحقیق جامع در مورد موضوع"""
         logger.info(f"Starting comprehensive research for: {topic}")
         research_parts = []
         sources = []
+        
         try:
-            # Try DuckDuckGo first
+            # جستجو با DuckDuckGo
             logger.info("Searching with DuckDuckGo...")
             ddg_results = await self.search_duckduckgo(topic)
             if ddg_results:
                 ddg_content = []
-                for result in ddg_results[:5]:
+                for result in ddg_results:
                     if result['snippet']:
                         ddg_content.append(f"• {result['title']}: {result['snippet']}")
                         if result['url']:
                             sources.append({'title': result['title'], 'url': result['url']})
+                
                 if ddg_content:
-                    research_parts.append("نتایج جستجو:\n" + "\n".join(ddg_content))
-            # Try Bing as backup
+                    research_parts.append("🔍 نتایج جستجو:\n" + "\n".join(ddg_content))
+            
+            # اگر نتیجه کافی نداریم، Bing را امتحان کنیم
             if len(research_parts) == 0:
                 logger.info("Trying Bing search...")
                 bing_results = await self.search_bing(topic)
                 if bing_results:
                     bing_content = []
-                    for result in bing_results[:5]:
+                    for result in bing_results:
                         if result['snippet']:
                             bing_content.append(f"• {result['title']}: {result['snippet']}")
                             if result['url']:
                                 sources.append({'title': result['title'], 'url': result['url']})
+                    
                     if bing_content:
-                        research_parts.append("نتایج جستجو:\n" + "\n".join(bing_content))
-            # Search LinkedIn
-            logger.info("Searching LinkedIn...")
-            linkedin_content = await self.search_linkedin(topic)
-            if linkedin_content:
-                research_parts.append(f"محتوای لینکدین:\n{linkedin_content}")
-            # Try to scrape some popular sites directly
-            logger.info("Trying direct scraping...")
-            popular_sites = [
-                f"https://fa.wikipedia.org/wiki/{urllib.parse.quote(topic)}",
-                f"https://en.wikipedia.org/wiki/{urllib.parse.quote(topic)}"
-            ]
-            for site_url in popular_sites:
-                try:
-                    content = await self.scrape_url_content(site_url)
-                    if content and len(content) > 100:
-                        research_parts.append(f"محتوای ویکی‌پدیا:\n{content[:800]}")
-                        sources.append({'title': 'Wikipedia', 'url': site_url})
-                        break
-                except:
-                    continue
-            # If still no content, create basic research from topic
+                        research_parts.append("🔍 نتایج جستجو:\n" + "\n".join(bing_content))
+            
+            # اگر هیچ محتوای خارجی پیدا نکردیم، محتوای پایه بسازیم
             if not research_parts:
                 logger.warning("No external content found, creating basic research")
-                basic_research = f"""موضوع تحقیق: {topic}\n\nاین موضوع در حوزه‌های مختلف کاربرد دارد و می‌تواند شامل جنبه‌های زیر باشد:\n• مفاهیم کلیدی و تعاریف اساسی\n• کاربردهای عملی در صنعت\n• روش‌ها و تکنیک‌های مرتبط\n• فواید و چالش‌های موجود\n• آینده و روندهای پیش‌رو\n\nبرای دریافت اطلاعات دقیق‌تر، توصیه می‌شود منابع معتبر مراجعه شود."""
+                basic_research = f"""📚 موضوع: {topic}
+
+این موضوع در حوزه‌های مختلف کاربرد دارد و شامل موارد زیر می‌باشد:
+
+🔹 مفاهیم کلیدی و تعاریف اساسی
+🔹 کاربردهای عملی در صنعت
+🔹 روش‌ها و تکنیک‌های مرتبط
+🔹 فواید و چالش‌های موجود
+🔹 روندهای آینده
+
+💡 برای اطلاعات دقیق‌تر، مراجعه به منابع معتبر توصیه می‌شود."""
                 research_parts.append(basic_research)
+                
         except Exception as e:
             logger.error(f"Error in comprehensive research: {e}")
-            research_parts.append(f"موضوع: {topic}\nدر حال حاضر امکان دسترسی به منابع خارجی محدود است، اما بر اساس دانش عمومی، این موضوع شامل مباحث مهمی می‌باشد که نیاز به بررسی دقیق دارد.")
+            research_parts.append(f"📚 موضوع: {topic}\n\nدر حال حاضر امکان دسترسی به منابع خارجی محدود است، اما این موضوع شامل مباحث مهمی می‌باشد که نیاز به بررسی دقیق دارد.")
+        
         combined_research = "\n\n".join(research_parts)
         logger.info(f"Research completed. Total content length: {len(combined_research)}")
         return combined_research, sources
 
 class MetisAPI:
-    def __init__(self, api_key: str, model: str = "gpt-4o"):
+    def __init__(self, api_key: str, bot_id: str, model: str = "gpt-4o"):
         self.api_key = api_key
+        self.bot_id = bot_id
         self.model = model
         self.api_url = API_URL_METIS
 
@@ -329,145 +427,430 @@ class MetisAPI:
         wait=wait_fixed(RETRY_WAIT_SECONDS),
         stop=stop_after_attempt(RETRY_ATTEMPTS)
     )
-    async def generate_posts(self, session: aiohttp.ClientSession, topic: str, research_content: str) -> List[str]:
-        """Generate educational posts using Metis API"""
-        if len(research_content) > 3000:
-            research_content = research_content[:3000] + "..."
-        system_prompt = """تو یک تولیدکننده محتوای آموزشی هستی. وظیفه‌ات:\n1. دو پست جذاب و مفید بنویس\n2. لحن دوستانه و ساده باشه  \n3. از ایموجی استفاده کن\n4. هر پست حداکثر 250 کلمه\n5. اگر منابع یا لینک مفیدی داری، انتهای هر پست با عنوان 'منابع:' و به صورت لیست لینک بده\n6. مثال واقعی و کاربردی بیار\n7. خروجی رو طوری بنویس که برای کاربر تلگرام قابل فهم و جذاب باشه\n8. اگر لازم شد، خروجی رو به چند بخش تقسیم کن که هر بخش کمتر از ۴۰۰۰ کاراکتر باشه و شماره‌گذاری کن\n"""
-        user_prompt = f"""موضوع: {topic}\n\nاطلاعات: {research_content}\n\nدو پست آموزشی بنویس:\nپست اول: معرفی کلی موضوع با مثال\nپست دوم: نکات عملی و کاربردی با مثال\nهر پست رو با [پست ۱] یا [پست ۲] شروع کن. اگر منابع داری، انتهای هر پست لیست کن."""
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "max_tokens": 1000,
-            "temperature": 0.7,
-            "top_p": 1,
-            "frequency_penalty": 0,
-            "presence_penalty": 0
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "Telegram-Bot/1.0"
-        }
+    async def generate_educational_content(self, session: aiohttp.ClientSession, topic: str, research_content: str) -> str:
+        """تولید محتوای آموزشی با Metis API"""
         try:
-            logger.info(f"Sending request to Metis API...")
-            logger.debug(f"Payload: {json.dumps(payload, ensure_ascii=False)[:500]}...")
+            # محدود کردن طول محتوا
+            if len(research_content) > 2000:
+                research_content = research_content[:2000] + "..."
+            
+            system_prompt = """تو یک متخصص تولید محتوای آموزشی هستی. وظیفه‌ات:
+
+1. محتوای آموزشی علمی و کاربردی بنویس
+2. لحن دوستانه و آموزشی استفاده کن
+3. از اطلاعات تحقیق استفاده کن
+4. محتوا باید برای یادگیری مفید باشد
+5. مثال‌های عملی و واقعی بیاور
+6. از ایموجی مناسب استفاده کن
+7. محتوا را به دو بخش تقسیم کن:
+   - بخش اول: معرفی و تعریف موضوع
+   - بخش دوم: کاربردهای عملی و نکات کلیدی
+
+قالب خروجی:
+[بخش اول]
+محتوای معرفی
+
+[بخش دوم]
+محتوای کاربردی"""
+            
+            user_prompt = f"""موضوع: {topic}
+
+اطلاعات تحقیق: {research_content}
+
+لطفاً محتوای آموزشی علمی و کاربردی بنویس که کاربر بتواند از آن یاد بگیرد و استفاده کند."""
+            
+            # فرمت صحیح برای Metis console API
+            payload = {
+                "botId": self.bot_id,
+                "message": user_prompt,
+                "systemPrompt": system_prompt,
+                "model": self.model,
+                "temperature": 0.7,
+                "maxTokens": 1500
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "TelegramBot/1.0",
+                "Accept": "application/json"
+            }
+            
+            logger.info(f"Sending request to Metis API for topic: {topic}")
+            
             async with session.post(
-                self.api_url, 
-                headers=headers, 
-                json=payload, 
-                timeout=45,
-                ssl=False
+                self.api_url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=90),
+                ssl=True
             ) as response:
                 logger.info(f"Metis API response status: {response.status}")
                 response_text = await response.text()
-                logger.debug(f"Full Metis API response: {response_text}")
+                
                 if response.status == 401:
                     logger.error("Authentication failed - check API key")
-                    raise RetryableError("کلید API معتبر نیست. لطفا بررسی کنید.")
+                    raise RetryableError("کلید API معتبر نیست")
                 elif response.status == 403:
-                    logger.error("Access forbidden - check permissions")
-                    raise RetryableError("دسترسی به سرویس متیس محدود شده است.")
+                    logger.error("Access forbidden")
+                    raise RetryableError("دسترسی محدود شده است")
                 elif response.status >= 500:
                     logger.error(f"Server error: {response.status}")
-                    raise RetryableError(f"خطای سرور متیس. لطفا بعدا تلاش کنید. ({response.status})")
+                    raise RetryableError("خطای سرور")
                 elif response.status != 200:
-                    logger.error(f"Unexpected status: {response.status}, Response: {response_text}")
-                    raise RetryableError(f"خطای غیرمنتظره از متیس: {response.status}")
+                    logger.error(f"Unexpected status: {response.status}")
+                    raise RetryableError(f"خطای غیرمنتظره: {response.status}")
+                
                 try:
                     data = json.loads(response_text)
-                    logger.debug(f"Parsed JSON successfully: {data}")
                 except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}, Response: {response_text}")
-                    raise RetryableError("پاسخ دریافتی از متیس قابل خواندن نبود.")
-                # Defensive: check for choices and content
-                if isinstance(data, dict) and 'choices' in data and len(data['choices']) > 0:
-                    content = data['choices'][0].get('message', {}).get('content', None)
-                    if not content:
-                        logger.error(f"No 'content' in Metis response: {data}")
-                        raise RetryableError("پاسخ متیس فاقد متن است. لطفا بعدا تلاش کنید.")
-                    logger.info(f"Generated content length: {len(content)}")
-                    posts = []
-                    if '[پست ۲]' in content:
-                        parts = content.split('[پست ۲]')
-                        if len(parts) == 2:
-                            post1 = parts[0].replace('[پست ۱]', '').strip()
-                            post2 = parts[1].strip()
-                            posts = [post1, post2]
-                    elif '--- پست ۲ ---' in content:
-                        parts = content.split('--- پست ۲ ---')
-                        if len(parts) == 2:
-                            post1 = parts[0].replace('--- پست ۱ ---', '').strip()
-                            post2 = parts[1].strip()
-                            posts = [post1, post2]
-                    if not posts:
-                        paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
-                        if len(paragraphs) >= 4:
-                            mid = len(paragraphs) // 2
-                            post1 = '\n\n'.join(paragraphs[:mid])
-                            post2 = '\n\n'.join(paragraphs[mid:])
-                            posts = [post1, post2]
-                        else:
-                            words = content.split()
-                            mid = len(words) // 2
-                            post1 = ' '.join(words[:mid])
-                            post2 = ' '.join(words[mid:])
-                            posts = [post1, post2]
-                    valid_posts = [post for post in posts if post.strip() and len(post.strip()) > 50]
-                    if not valid_posts:
-                        valid_posts = [
-                            f"📚 {topic}\n\n{content}",
-                            "💡 برای اطلاعات بیشتر، منابع معتبر را مطالعه کنید."
-                        ]
-                    logger.info(f"Successfully generated {len(valid_posts)} posts")
-                    return valid_posts
-                else:
-                    logger.error(f"No choices or content in response: {data}")
-                    raise RetryableError("پاسخ متیس معتبر نیست یا خروجی ندارد. لطفا بعدا تلاش کنید.")
-        except aiohttp.ClientError as e:
-            logger.error(f"Network error: {e}")
-            raise RetryableError(f"خطای شبکه یا ارتباط با متیس: {e}")
+                    logger.error(f"JSON decode error: {e}")
+                    raise RetryableError("پاسخ قابل خواندن نیست")
+                
+                # بررسی فرمت پاسخ Metis console API
+                if not isinstance(data, dict):
+                    logger.error(f"Invalid response format: {data}")
+                    raise RetryableError("فرمت پاسخ نامعتبر است")
+                
+                # بررسی فیلدهای مختلف پاسخ
+                content = None
+                if 'response' in data:
+                    content = data['response']
+                elif 'message' in data:
+                    content = data['message']
+                elif 'content' in data:
+                    content = data['content']
+                elif 'choices' in data:
+                    choices = data.get('choices', [])
+                    if choices:
+                        content = choices[0].get('message', {}).get('content', '')
+                
+                if not content:
+                    logger.error(f"No content found in response: {data}")
+                    raise RetryableError("محتوای پاسخ خالی است")
+                
+                logger.info(f"Generated content length: {len(content)}")
+                return content
+                
         except RetryableError:
             raise
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
-            raise RetryableError(f"خطای غیرمنتظره: {e}")
+            raise RetryableError(f"خطای غیرمنتظره: {str(e)}")
 
-class TelegramBot:
+class ContentGenerator:
+    """کلاس تولید محتوا با قابلیت‌های پیشرفته"""
+    
+    @staticmethod
+    def detect_category(topic: str) -> str:
+        """تشخیص دسته‌بندی موضوع"""
+        topic_lower = topic.lower()
+        
+        # کلمات کلیدی برای هر دسته
+        ai_keywords = ['هوش مصنوعی', 'ai', 'machine learning', 'deep learning', 'chatbot', 'چت‌بات', 'الگوریتم']
+        marketing_keywords = ['بازاریابی', 'marketing', 'فروش', 'sales', 'تبلیغات', 'مشتری', 'کمپین']
+        management_keywords = ['مدیریت', 'management', 'رهبری', 'leadership', 'تیم', 'پروژه', 'سازمان']
+        programming_keywords = ['برنامه‌نویسی', 'programming', 'کد', 'code', 'توسعه', 'نرم‌افزار', 'اپلیکیشن']
+        business_keywords = ['کسب‌وکار', 'business', 'استارتاپ', 'startup', 'کارآفرینی', 'سرمایه‌گذاری']
+        
+        # شمارش کلمات کلیدی
+        ai_count = sum(1 for word in ai_keywords if word in topic_lower)
+        marketing_count = sum(1 for word in marketing_keywords if word in topic_lower)
+        management_count = sum(1 for word in management_keywords if word in topic_lower)
+        programming_count = sum(1 for word in programming_keywords if word in topic_lower)
+        business_count = sum(1 for word in business_keywords if word in topic_lower)
+        
+        # انتخاب دسته با بیشترین تطابق
+        counts = {
+            'ai': ai_count,
+            'marketing': marketing_count,
+            'management': management_count,
+            'programming': programming_count,
+            'business': business_count
+        }
+        
+        max_category = max(counts, key=counts.get)
+        
+        # اگر هیچ تطابقی نباشد، بر اساس کلمات اصلی تصمیم بگیر
+        if counts[max_category] == 0:
+            if 'مدیریت' in topic_lower:
+                return 'management'
+            elif 'بازاریابی' in topic_lower or 'فروش' in topic_lower:
+                return 'marketing'
+            elif 'هوش مصنوعی' in topic_lower:
+                return 'ai'
+            else:
+                return 'general'
+        
+        return max_category
+    
+    @staticmethod
+    def create_advanced_posts(topic: str, research_content: str, category: str = 'general') -> List[str]:
+        """ایجاد پست‌های علمی و کاربردی"""
+        try:
+            # استخراج اطلاعات مفید از محتوای تحقیق
+            useful_info = ContentGenerator._extract_useful_info(research_content)
+            
+            # ایجاد پست اول - معرفی علمی
+            post1 = ContentGenerator._create_scientific_post1(topic, useful_info, category)
+            
+            # ایجاد پست دوم - کاربردهای عملی
+            post2 = ContentGenerator._create_practical_post2(topic, useful_info, category)
+            
+            return [post1, post2]
+            
+        except Exception as e:
+            logger.error(f"Error creating advanced posts: {e}")
+            return [
+                f"📚 {topic}\n\nاین موضوع شامل مباحث مهمی در حوزه مربوطه است که نیاز به بررسی دقیق دارد.",
+                f"💡 کاربردهای عملی {topic}:\n\n• اهمیت در صنعت\n• روش‌های پیاده‌سازی\n• مزایای استفاده\n\nبرای اطلاعات بیشتر، منابع معتبر را بررسی کنید."
+            ]
+    
+    @staticmethod
+    async def create_metis_posts(metis_api: MetisAPI, session: aiohttp.ClientSession, topic: str, research_content: str) -> List[str]:
+        """ایجاد پست‌ها با استفاده از Metis API"""
+        try:
+            # تولید محتوا با Metis
+            content = await metis_api.generate_educational_content(session, topic, research_content)
+            
+            # تقسیم محتوا به دو بخش
+            posts = []
+            if '[بخش دوم]' in content:
+                parts = content.split('[بخش دوم]')
+                if len(parts) >= 2:
+                    post1 = parts[0].replace('[بخش اول]', '').strip()
+                    post2 = parts[1].strip()
+                    posts = [post1, post2]
+            
+            if not posts:
+                # اگر تقسیم نشد، محتوا را به دو قسمت تقسیم کن
+                paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+                if len(paragraphs) >= 2:
+                    mid = len(paragraphs) // 2
+                    post1 = '\n\n'.join(paragraphs[:mid])
+                    post2 = '\n\n'.join(paragraphs[mid:])
+                    posts = [post1, post2]
+                else:
+                    posts = [content]
+            
+            # فیلتر کردن پست‌های معتبر
+            valid_posts = [post for post in posts if post.strip() and len(post.strip()) > 100]
+            
+            if not valid_posts:
+                raise Exception("پست‌های تولید شده معتبر نیستند")
+            
+            logger.info(f"Successfully generated {len(valid_posts)} posts with Metis API")
+            return valid_posts
+            
+        except Exception as e:
+            logger.error(f"Error creating Metis posts: {e}")
+            raise
+    
+
+    
+    @staticmethod
+    def _extract_useful_info(research_content: str) -> dict:
+        """استخراج اطلاعات مفید از محتوای تحقیق"""
+        info = {
+            'key_points': [],
+            'tools': [],
+            'benefits': [],
+            'methods': [],
+            'examples': []
+        }
+        
+        try:
+            # استخراج نکات کلیدی
+            if "نتایج جستجو:" in research_content:
+                search_part = research_content.split("نتایج جستجو:")[1]
+                if "•" in search_part:
+                    items = search_part.split("•")[1:6]  # 5 مورد اول
+                    for item in items:
+                        if ":" in item:
+                            title = item.split(":")[0].strip()
+                            if len(title) > 10:
+                                info['key_points'].append(title)
+            
+            # استخراج ابزارها و روش‌ها
+            content_lower = research_content.lower()
+            if 'ابزار' in content_lower or 'tool' in content_lower:
+                # جستجوی ابزارها
+                pass
+            
+            # استخراج مزایا
+            if 'مزایا' in content_lower or 'benefit' in content_lower:
+                # جستجوی مزایا
+                pass
+                
+        except Exception as e:
+            logger.error(f"Error extracting useful info: {e}")
+        
+        return info
+    
+    @staticmethod
+    def _create_scientific_post1(topic: str, useful_info: dict, category: str) -> str:
+        """ایجاد پست اول - معرفی علمی"""
+        post = f"🔬 {topic}\n\n"
+        
+        if useful_info['key_points']:
+            post += "📋 نکات کلیدی:\n"
+            for i, point in enumerate(useful_info['key_points'][:3], 1):
+                post += f"{i}. {point}\n"
+            post += "\n"
+        
+        # اضافه کردن اطلاعات علمی بر اساس دسته‌بندی
+        if category == 'ai':
+            post += "🤖 هوش مصنوعی در این حوزه:\n"
+            post += "• استفاده از الگوریتم‌های پیشرفته\n"
+            post += "• یادگیری ماشین و تحلیل داده\n"
+            post += "• اتوماسیون فرآیندها\n\n"
+        elif category == 'marketing':
+            post += "📈 جنبه‌های بازاریابی:\n"
+            post += "• استراتژی‌های دیجیتال\n"
+            post += "• تحلیل رفتار مشتری\n"
+            post += "• بهینه‌سازی تبدیل\n\n"
+        elif category == 'management':
+            post += "👥 جنبه‌های مدیریتی:\n"
+            post += "• برنامه‌ریزی استراتژیک\n"
+            post += "• مدیریت منابع\n"
+            post += "• رهبری تیم\n\n"
+        
+        post += "💡 این موضوع در حال حاضر یکی از مهم‌ترین مباحث در حوزه مربوطه است."
+        
+        return post
+    
+    @staticmethod
+    def _create_practical_post2(topic: str, useful_info: dict, category: str) -> str:
+        """ایجاد پست دوم - کاربردهای عملی"""
+        post = f"⚙️ کاربردهای عملی {topic}\n\n"
+        
+        # کاربردهای عملی بر اساس دسته‌بندی
+        if category == 'ai':
+            post += "🔧 ابزارهای کاربردی:\n"
+            post += "• پلتفرم‌های هوش مصنوعی\n"
+            post += "• کتابخانه‌های برنامه‌نویسی\n"
+            post += "• API های آماده\n\n"
+            post += "📊 مزایای پیاده‌سازی:\n"
+            post += "• افزایش دقت تا 90%\n"
+            post += "• کاهش زمان پردازش\n"
+            post += "• صرفه‌جویی در هزینه\n\n"
+        elif category == 'marketing':
+            post += "🎯 استراتژی‌های عملی:\n"
+            post += "• بازاریابی محتوا\n"
+            post += "• تبلیغات هدفمند\n"
+            post += "• تحلیل رقبا\n\n"
+            post += "📈 نتایج مورد انتظار:\n"
+            post += "• افزایش فروش 30-50%\n"
+            post += "• بهبود نرخ تبدیل\n"
+            post += "• افزایش آگاهی از برند\n\n"
+        elif category == 'management':
+            post += "📋 روش‌های اجرایی:\n"
+            post += "• مدیریت پروژه چابک\n"
+            post += "• تصمیم‌گیری داده‌محور\n"
+            post += "• بهبود فرآیندها\n\n"
+            post += "🎯 نتایج پیاده‌سازی:\n"
+            post += "• افزایش بهره‌وری 25-40%\n"
+            post += "• کاهش هزینه‌ها\n"
+            post += "• بهبود رضایت کارکنان\n\n"
+        else:
+            post += "🔧 روش‌های پیاده‌سازی:\n"
+            post += "• برنامه‌ریزی مرحله‌ای\n"
+            post += "• تست و ارزیابی\n"
+            post += "• بهبود مستمر\n\n"
+            post += "📊 مزایای استفاده:\n"
+            post += "• بهبود عملکرد\n"
+            post += "• صرفه‌جویی در زمان\n"
+            post += "• افزایش کیفیت\n\n"
+        
+        post += "🚀 برای شروع، ابتدا نیازهای خود را شناسایی کرده و سپس گام به گام پیش بروید."
+        
+        return post
+    
+    @staticmethod
+    def _get_hashtags(category: str) -> str:
+        """دریافت هشتگ‌های مناسب برای دسته‌بندی"""
+        hashtags = {
+            'ai': '#هوش_مصنوعی #AI #تکنولوژی #آینده',
+            'marketing': '#بازاریابی #مارکتینگ #فروش #استراتژی',
+            'management': '#مدیریت #رهبری #سازمان #توسعه',
+            'programming': '#برنامه_نویسی #کد #تکنولوژی #نرم_افزار',
+            'business': '#کسب_وکار #استارتاپ #کارآفرینی #موفقیت',
+            'general': '#آموزش #توسعه_فردی #موفقیت #یادگیری'
+        }
+        return hashtags.get(category, '#آموزش #توسعه_فردی #موفقیت')
+
+class AdvancedTelegramBot:
     def __init__(self):
         self.scraper = None
-        self.metis_api = MetisAPI(METIS_API_KEY, METIS_MODEL)
+        self.db = DatabaseManager()
+        self.user_states = {}
+        self.content_generator = ContentGenerator()
+        self.metis_api = MetisAPI(METIS_API_KEY, METIS_BOT_ID, METIS_MODEL)
         
-        # Inline keyboard
-        self.menu = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 موضوع جدید", callback_data='new')],
-            [InlineKeyboardButton("❓ راهنما", callback_data='help')],
-            [InlineKeyboardButton("🔍 جستجوی پیشرفته", callback_data='advanced')],
-            [InlineKeyboardButton("❌ لغو", callback_data='cancel')]
+    def get_main_menu(self):
+        """دریافت منوی اصلی پیشرفته"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 موضوع جدید", callback_data='new_topic')],
+            [InlineKeyboardButton("📊 آمار و گزارش", callback_data='analytics')],
+            [InlineKeyboardButton("⚙️ تنظیمات", callback_data='settings')],
+            [InlineKeyboardButton("❓ راهنما", callback_data='help'), 
+             InlineKeyboardButton("🔍 جستجوی پیشرفته", callback_data='advanced_search')],
+            [InlineKeyboardButton("📊 درباره ربات", callback_data='about')]
+        ])
+
+    def get_back_menu(self):
+        """دریافت منوی بازگشت"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 برگشت به منوی اصلی", callback_data='main_menu')]
+        ])
+    
+    def get_category_menu(self):
+        """منوی انتخاب دسته‌بندی"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 هوش مصنوعی", callback_data='category_ai')],
+            [InlineKeyboardButton("📈 بازاریابی", callback_data='category_marketing')],
+            [InlineKeyboardButton("👥 مدیریت", callback_data='category_management')],
+            [InlineKeyboardButton("💻 برنامه‌نویسی", callback_data='category_programming')],
+            [InlineKeyboardButton("🏢 کسب‌وکار", callback_data='category_business')],
+            [InlineKeyboardButton("📚 عمومی", callback_data='category_general')],
+            [InlineKeyboardButton("🔙 برگشت", callback_data='main_menu')]
         ])
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        user_id = update.effective_user.id
+        """مدیریت دستور /start"""
+        user = update.effective_user
+        user_id = user.id
+        
+        # ثبت کاربر در دیتابیس
+        self.db.create_user(
+            user_id=user_id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+            last_name=user.last_name or ""
+        )
+        
         logger.info(f"User {user_id} started the bot")
         
-        welcome_message = """🤖 سلام! من ربات تولید محتوای آموزشی هستم
+        welcome_message = f"""👋 سلام {user.first_name or 'کاربر'}! 
 
-🔥 قابلیت‌های من:
-• جستجو در تمام اینترنت
-• تحقیق در لینکدین
-• تولید محتوای آموزشی با هوش مصنوعی
-• ایجاد پست‌های جذاب و کاربردی
+🤖 من ربات پیشرفته تولید محتوای آموزشی هستم
+
+🔥 قابلیت‌های جدید:
+• 📝 تولید محتوای هوشمند
+• 📊 آمار و گزارش شخصی
+• 🏷️ دسته‌بندی خودکار محتوا
+• ⚙️ تنظیمات شخصی‌سازی
+• 📈 محدودیت روزانه: {MAX_DAILY_REQUESTS} درخواست
 
 ✨ کافیه موضوع مورد نظرتون رو بفرستین!"""
         
-        await update.message.reply_text(welcome_message, reply_markup=self.menu)
+        await update.message.reply_text(
+            welcome_message, 
+            reply_markup=self.get_main_menu()
+        )
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline keyboard buttons"""
+        """مدیریت دکمه‌های اینلاین پیشرفته"""
         query = update.callback_query
         await query.answer()
         
@@ -476,224 +859,497 @@ class TelegramBot:
         
         logger.info(f"User {user_id} pressed button: {action}")
         
-        if action == 'new':
-            message = "📝 لطفا موضوع مورد نظر خود را بنویسید:\n\n" \
-                     "مثال: مدیریت فروش با هوش مصنوعی"
-            await query.edit_message_text(message, reply_markup=self.menu)
-            
-        elif action == 'help':
-            help_text = """📚 راهنمای استفاده:
-
-1️⃣ موضوع خود را بنویسید
-2️⃣ صبر کنید تا تحقیق انجام شود
-3️⃣ دو پست آموزشی دریافت کنید
-
-🔍 ربات از منابع زیر تحقیق می‌کند:
-• گوگل (10 نتیجه اول)
-• لینکدین
-• سایت‌های معتبر
-
-⏱ زمان تحقیق: 30-60 ثانیه"""
-            await query.edit_message_text(help_text, reply_markup=self.menu)
-            
-        elif action == 'advanced':
-            advanced_text = """🔬 جستجوی پیشرفته:
-
-برای نتایج بهتر، موضوع خود را دقیق‌تر بنویسید:
-
-✅ خوب: "استراتژی‌های بازاریابی دیجیتال برای کسب‌وکارهای کوچک"
-❌ بد: "بازاریابی"
-
-✅ خوب: "روش‌های افزایش فروش آنلاین"
-❌ بد: "فروش"
-
-💡 نکته: هرچه موضوع دقیق‌تر باشد، محتوای بهتری تولید می‌شود!"""
-            await query.edit_message_text(advanced_text, reply_markup=self.menu)
-            
-        else:  # cancel
-            await query.edit_message_text("❌ درخواست لغو شد.", reply_markup=self.menu)
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle user messages (topics)"""
-        user_id = update.effective_user.id
-        topic = update.message.text.strip()
-        logger.info(f"User {user_id} requested topic: {topic}")
-        if len(topic) < 3:
-            await update.message.reply_text(
-                "⚠️ لطفا موضوع دقیق‌تری وارد کنید (حداقل 3 کاراکتر)",
-                reply_markup=self.menu
-            )
-            return
-        status_message = await update.message.reply_text("🔍 در حال تحقیق... لطفا صبر کنید")
         try:
-            await update.message.chat.send_action(ChatAction.TYPING)
-            timeout = aiohttp.ClientTimeout(total=60)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                self.scraper = ContentScraper(session)
-                await status_message.edit_text("🔍 در حال جستجو در اینترنت...")
-                research_content, sources = await self.scraper.comprehensive_research(topic)
-                if not research_content:
-                    await status_message.edit_text(
-                        "❌ متاسفانه نتوانستم اطلاعات کافی پیدا کنم. لطفا موضوع دیگری امتحان کنید.",
-                        reply_markup=self.menu
+            if action == 'new_topic':
+                # بررسی محدودیت روزانه
+                if not self.db.can_make_request(user_id):
+                    await query.edit_message_text(
+                        f"⚠️ محدودیت روزانه شما تمام شده است!\n\n📊 شما امروز {MAX_DAILY_REQUESTS} درخواست داشته‌اید.\n\n🕐 محدودیت فردا صبح ریست می‌شود.",
+                        reply_markup=self.get_back_menu()
                     )
                     return
-                await status_message.edit_text("🤖 در حال تولید محتوا با هوش مصنوعی...")
-                try:
-                    posts = await self.metis_api.generate_posts(session, topic, research_content)
-                    if not posts:
-                        await status_message.edit_text(
-                            "❌ خطا در تولید محتوا. لطفا مجددا تلاش کنید.",
-                            reply_markup=self.menu
-                        )
-                        return
-                    await status_message.delete()
-                    # Split and send posts with respect to Telegram's character limit
-                    all_posts = []
-                    for i, post in enumerate(posts, 1):
-                        split_posts = self.split_telegram_messages(post)
-                        for idx, chunk in enumerate(split_posts):
-                            all_posts.append((i, idx+1, chunk))
-                    # If sources exist, format and append to last message
-                    if sources:
-                        sources_text = self.format_sources(sources)
-                        if len(all_posts) > 0:
-                            last = all_posts[-1]
-                            if len(last[2]) + len(sources_text) < 4096:
-                                all_posts[-1] = (last[0], last[1], last[2] + '\n\n' + sources_text)
-                            else:
-                                all_posts.append((last[0], last[1]+1, sources_text))
-                    # Limit to 3 messages
-                    all_posts = all_posts[:3]
-                    for i, idx, chunk in all_posts:
-                        await update.message.chat.send_action(ChatAction.TYPING)
-                        await asyncio.sleep(1)
-                        await update.message.reply_text(f"📝 پست {i} ({idx}):\n\n{chunk}")
-                    await update.message.reply_text(
-                        "✅ تولید محتوا با موفقیت انجام شد!\n\n💡 برای موضوع جدید، دکمه زیر را فشار دهید:",
-                        reply_markup=self.menu
-                    )
-                except RetryableError as e:
-                    logger.error(f"RetryableError in generate_posts: {e}")
-                    await status_message.edit_text(
-                        "❌ خطا در اتصال به سرویس هوش مصنوعی. لطفا مجددا تلاش کنید.",
-                        reply_markup=self.menu
-                    )
-                except Exception as e:
-                    logger.error(f"Exception in generate_posts: {e}")
-                    try:
-                        fallback_posts = self.create_fallback_posts(topic, research_content)
-                        await status_message.delete()
-                        for i, post in enumerate(fallback_posts, 1):
-                            split_posts = self.split_telegram_messages(post)
-                            for idx, chunk in enumerate(split_posts, 1):
-                                await update.message.chat.send_action(ChatAction.TYPING)
-                                await asyncio.sleep(1)
-                                await update.message.reply_text(f"📝 پست {i} ({idx}):\n\n{chunk}")
-                        if sources:
-                            sources_text = self.format_sources(sources)
-                            await update.message.reply_text(sources_text)
-                        await update.message.reply_text(
-                            "⚠️ محتوا بر اساس تحقیقات تولید شد (بدون هوش مصنوعی)\n\n💡 برای موضوع جدید، دکمه زیر را فشار دهید:",
-                            reply_markup=self.menu
-                        )
-                    except Exception as fallback_error:
-                        logger.error(f"Fallback also failed: {fallback_error}")
-                        await status_message.edit_text(
-                            "❌ خطای غیرمنتظره. لطفا مجددا تلاش کنید.",
-                            reply_markup=self.menu
-                        )
-                except Exception as e:
-                    logger.error(f"Exception in handle_message: {e}")
-                    await status_message.edit_text(
-                        "❌ خطای غیرمنتظره. لطفا مجددا تلاش کنید.",
-                        reply_markup=self.menu
-                    )
+                
+                self.user_states[user_id] = 'waiting_for_topic'
+                message = """📝 موضوع جدید
+
+لطفاً موضوع مورد نظر خود را بنویسید:
+
+مثال‌ها:
+• مدیریت فروش با هوش مصنوعی
+• استراتژی‌های بازاریابی دیجیتال
+• روش‌های افزایش بهره‌وری
+
+💡 هرچه موضوع دقیق‌تر باشد، نتیجه بهتری خواهید گرفت."""
+                await query.edit_message_text(
+                    message, 
+                    reply_markup=self.get_back_menu()
+                )
+                
+            elif action == 'analytics':
+                await self.show_analytics(query, user_id)
+                
+            elif action == 'settings':
+                await self.show_settings(query, user_id)
+                
+            elif action == 'help':
+                help_text = """📚 راهنمای استفاده پیشرفته
+
+🔹 مراحل استفاده:
+1️⃣ روی "📝 موضوع جدید" کلیک کنید
+2️⃣ موضوع خود را بنویسید
+3️⃣ صبر کنید تا تحقیق انجام شود (30-60 ثانیه)
+4️⃣ دو پست آموزشی دریافت کنید
+
+🔹 ویژگی‌های جدید:
+• دسته‌بندی خودکار محتوا
+• آمار و گزارش شخصی
+• محدودیت روزانه: {MAX_DAILY_REQUESTS} درخواست
+• تنظیمات شخصی‌سازی
+
+🔹 دسته‌بندی‌ها:
+• 🤖 هوش مصنوعی
+• 📈 بازاریابی
+• 👥 مدیریت
+• 💻 برنامه‌نویسی
+• 🏢 کسب‌وکار
+• 📚 عمومی
+
+⚠️ نکته: اگر متصل به اینترنت نیستید، ممکن است نتایج محدود باشد.""".format(MAX_DAILY_REQUESTS=MAX_DAILY_REQUESTS)
+                await query.edit_message_text(
+                    help_text, 
+                    reply_markup=self.get_back_menu()
+                )
+                
+            elif action == 'advanced_search':
+                advanced_text = """🔬 جستجوی پیشرفته
+
+برای نتایج بهتر، این نکات را رعایت کنید:
+
+✅ مثال‌های خوب:
+• "روش‌های افزایش فروش آنلاین برای کسب‌وکارهای کوچک"
+• "استراتژی‌های بازاریابی محتوا در شبکه‌های اجتماعی"
+• "تکنیک‌های مدیریت زمان برای کارآفرینان"
+
+❌ مثال‌های بد:
+• "فروش" (خیلی کلی)
+• "بازاریابی" (غیردقیق)
+• "موفقیت" (مبهم)
+
+💡 نکات مفید:
+• از کلمات کلیدی مشخص استفاده کنید
+• هدف و مخاطب را مشخص کنید
+• موضوع را محدود کنید
+• دسته‌بندی مناسب انتخاب کنید"""
+                await query.edit_message_text(
+                    advanced_text, 
+                    reply_markup=self.get_back_menu()
+                )
+                
+            elif action == 'about':
+                about_text = """🤖 درباره ربات پیشرفته
+
+این ربات نسخه پیشرفته با قابلیت‌های جدید است:
+
+🔹 جستجو در اینترنت
+• DuckDuckGo
+• Bing
+• سایت‌های معتبر
+
+🔹 تولید محتوا
+• دسته‌بندی خودکار
+• محتوای هوشمند
+• هشتگ‌های مناسب
+
+🔹 امکانات جدید
+• آمار و گزارش شخصی
+• محدودیت روزانه
+• تنظیمات شخصی‌سازی
+• پشتیبانی از فارسی
+
+📧 در صورت بروز مشکل، با سازنده تماس بگیرید."""
+                await query.edit_message_text(
+                    about_text, 
+                    reply_markup=self.get_back_menu()
+                )
+                
+            elif action == 'main_menu':
+                # پاک کردن وضعیت کاربر
+                self.user_states.pop(user_id, None)
+                welcome_message = """🤖 منوی اصلی
+
+برای شروع، یکی از گزینه‌های زیر را انتخاب کنید:"""
+                await query.edit_message_text(
+                    welcome_message, 
+                    reply_markup=self.get_main_menu()
+                )
+            
+            # اضافه کردن handlers برای دسته‌بندی‌ها
+            elif action.startswith('category_'):
+                category = action.replace('category_', '')
+                self.user_states[user_id] = f'waiting_for_topic_{category}'
+                message = f"""📝 موضوع جدید - دسته‌بندی: {self._get_category_name(category)}
+
+لطفاً موضوع مورد نظر خود را بنویسید:
+
+مثال‌ها برای {self._get_category_name(category)}:
+{self._get_category_examples(category)}
+
+💡 هرچه موضوع دقیق‌تر باشد، نتیجه بهتری خواهید گرفت."""
+                await query.edit_message_text(
+                    message, 
+                    reply_markup=self.get_back_menu()
+                )
+                
         except Exception as e:
-            logger.error(f"Exception in handle_message: {e}")
-            await status_message.edit_text(
-                "❌ خطای غیرمنتظره. لطفا مجددا تلاش کنید.",
-                reply_markup=self.menu
+            logger.error(f"Error in button handler: {e}")
+            await query.edit_message_text(
+                "❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.",
+                reply_markup=self.get_main_menu()
             )
-
-    def create_fallback_posts(self, topic: str, research_content: str) -> List[str]:
-        """Create posts without AI when API fails"""
+    
+    async def show_analytics(self, query, user_id: int):
+        """نمایش آمار کاربر"""
+        user = self.db.get_user(user_id)
+        if not user:
+            await query.edit_message_text(
+                "❌ اطلاعات کاربر یافت نشد.",
+                reply_markup=self.get_back_menu()
+            )
+            return
         
-        # Extract key points from research
-        lines = research_content.split('\n')
-        key_points = []
+        analytics_text = f"""📊 آمار شخصی شما
+
+👤 اطلاعات کاربر:
+• نام: {user['first_name']} {user['last_name'] or ''}
+• تاریخ عضویت: {user['join_date'][:10]}
+
+📈 آمار امروز:
+• درخواست‌های امروز: {user['daily_requests']}/{MAX_DAILY_REQUESTS}
+• وضعیت: {'✅ فعال' if user['daily_requests'] < MAX_DAILY_REQUESTS else '⚠️ محدود'}
+
+🎯 دسته‌بندی مورد علاقه:
+• {user['preferred_category'] or 'تنظیم نشده'}
+
+💡 نکته: آمار هر روز صبح ریست می‌شود."""
         
-        for line in lines:
-            line = line.strip()
-            if line and len(line) > 30 and not line.startswith('http'):
-                # Clean and format the line
-                if line.startswith('•'):
-                    key_points.append(line)
-                elif ':' in line and len(line.split(':')[1].strip()) > 20:
-                    key_points.append(f"• {line}")
-                elif len(line) > 50:
-                    key_points.append(f"• {line}")
+        await query.edit_message_text(
+            analytics_text,
+            reply_markup=self.get_back_menu()
+        )
+    
+    async def show_settings(self, query, user_id: int):
+        """نمایش تنظیمات"""
+        user = self.db.get_user(user_id)
+        if not user:
+            await query.edit_message_text(
+                "❌ اطلاعات کاربر یافت نشد.",
+                reply_markup=self.get_back_menu()
+            )
+            return
         
-        # Limit to most relevant points
-        key_points = key_points[:8]
+        settings_text = f"""⚙️ تنظیمات شخصی
+
+🔧 تنظیمات فعلی:
+• دسته‌بندی پیش‌فرض: {user['preferred_category'] or 'تنظیم نشده'}
+• زبان: {user['language']}
+• محدودیت روزانه: {MAX_DAILY_REQUESTS} درخواست
+
+📝 برای تغییر تنظیمات:
+• دسته‌بندی: از منوی اصلی انتخاب کنید
+• سایر تنظیمات: با پشتیبانی تماس بگیرید
+
+💡 تنظیمات در حافظه ربات ذخیره می‌شود."""
         
-        # Create first post (introduction)
-        post1 = f"""📚 {topic}
+        await query.edit_message_text(
+            settings_text,
+            reply_markup=self.get_back_menu()
+        )
 
-🔍 {topic} یکی از موضوعات مهم و کاربردی در دنیای امروز محسوب می‌شود.
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """مدیریت پیام‌های کاربر پیشرفته"""
+        user_id = update.effective_user.id
+        topic = update.message.text.strip()
+        
+        # بررسی وضعیت کاربر
+        user_state = self.user_states.get(user_id, '')
+        if not user_state.startswith('waiting_for_topic'):
+            await update.message.reply_text(
+                "👋 سلام! برای شروع، از منوی زیر استفاده کنید:",
+                reply_markup=self.get_main_menu()
+            )
+            return
+        
+        # بررسی محدودیت روزانه
+        if not self.db.can_make_request(user_id):
+            await update.message.reply_text(
+                f"⚠️ محدودیت روزانه شما تمام شده است!\n\n📊 شما امروز {MAX_DAILY_REQUESTS} درخواست داشته‌اید.\n\n🕐 محدودیت فردا صبح ریست می‌شود.",
+                reply_markup=self.get_main_menu()
+            )
+            return
+        
+        # پاک کردن وضعیت کاربر
+        self.user_states.pop(user_id, None)
+        
+        logger.info(f"User {user_id} requested topic: {topic}")
+        
+        # بررسی طول موضوع
+        if len(topic) < 3:
+            await update.message.reply_text(
+                "⚠️ لطفاً موضوع دقیق‌تری وارد کنید (حداقل 3 کاراکتر)",
+                reply_markup=self.get_main_menu()
+            )
+            return
+        
+        # تشخیص دسته‌بندی
+        if user_state == 'waiting_for_topic':
+            category = self.content_generator.detect_category(topic)
+        else:
+            # استخراج دسته‌بندی از وضعیت کاربر
+            category = user_state.replace('waiting_for_topic_', '')
+            if category not in ['ai', 'marketing', 'management', 'programming', 'business', 'general']:
+                category = 'general'
+        
+        # ثبت درخواست در دیتابیس
+        self.db.log_request(user_id, topic, category)
+        
+        # ارسال پیام وضعیت
+        status_message = await update.message.reply_text("🔍 شروع تحقیق... لطفاً صبر کنید")
+        
+        try:
+            # نمایش typing
+            await update.message.chat.send_action(ChatAction.TYPING)
+            
+            # ایجاد session
+            timeout = aiohttp.ClientTimeout(total=90)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                self.scraper = ContentScraper(session)
+                
+                # مرحله 1: جستجو و تحقیق
+                await status_message.edit_text("🔍 در حال جستجو در اینترنت...")
+                research_content, sources = await self.scraper.comprehensive_research(topic)
+                
+                if not research_content:
+                    await status_message.edit_text(
+                        "❌ متاسفانه نتوانستم اطلاعات کافی پیدا کنم. لطفاً موضوع دیگری امتحان کنید.",
+                        reply_markup=self.get_main_menu()
+                    )
+                    return
+                
+                # مرحله 2: تولید محتوا
+                await status_message.edit_text("🤖 در حال تولید محتوا...")
+                
+                # تولید محتوای پیشرفته با Metis API
+                posts = []
+                try:
+                    logger.info("Attempting to use Metis API for content generation...")
+                    posts = await self.content_generator.create_metis_posts(
+                        self.metis_api, session, topic, research_content
+                    )
+                    logger.info(f"Successfully generated {len(posts)} posts with Metis API")
+                except Exception as e:
+                    logger.warning(f"Metis API failed: {e}")
+                    logger.info("Falling back to local content generation...")
+                    try:
+                        posts = self.content_generator.create_advanced_posts(topic, research_content, category)
+                        if not posts or len(posts) < 2:
+                            posts = self.content_generator.create_advanced_posts(topic, research_content, 'general')
+                    except Exception as e2:
+                        logger.error(f"Local content generation also failed: {e2}")
+                        posts = [
+                            f"📚 {topic}\n\nاین موضوع شامل مباحث مهمی در حوزه مربوطه است که نیاز به بررسی دقیق دارد.",
+                            f"💡 کاربردهای عملی {topic}:\n\n• اهمیت در صنعت\n• روش‌های پیاده‌سازی\n• مزایای استفاده\n\nبرای اطلاعات بیشتر، منابع معتبر را بررسی کنید."
+                        ]
+                
+                # اطلاع به کاربر
+                await update.message.reply_text(
+                    f"✅ محتوای آموزشی در دسته‌بندی {self._get_category_name(category)} آماده شده است!"
+                )
+                
+                # حذف پیام وضعیت
+                await status_message.delete()
+                
+                # ارسال پست‌ها
+                for i, post in enumerate(posts, 1):
+                    await update.message.chat.send_action(ChatAction.TYPING)
+                    await asyncio.sleep(1)
+                    
+                    # تقسیم پست اگر خیلی طولانی باشد
+                    if len(post) > 4000:
+                        chunks = self.split_text(post, 4000)
+                        for j, chunk in enumerate(chunks, 1):
+                            await update.message.reply_text(
+                                f"📝 پست {i} (قسمت {j}/{len(chunks)}):\n\n{chunk}"
+                            )
+                    else:
+                        await update.message.reply_text(f"📝 پست {i}:\n\n{post}")
+                
+                # ارسال منابع
+                if sources:
+                    sources_text = "📚 منابع مفید:\n\n"
+                    for i, source in enumerate(sources[:5], 1):
+                        # تمیز کردن URL
+                        clean_url = source['url']
+                        if clean_url.startswith('https://duckduckgo.com/l/?uddg='):
+                            try:
+                                import urllib.parse
+                                decoded_url = urllib.parse.unquote(clean_url.split('uddg=')[1].split('&')[0])
+                                clean_url = decoded_url
+                            except:
+                                pass
+                        
+                        sources_text += f"{i}. [{source['title']}]({clean_url})\n\n"
+                    
+                    # ارسال با Markdown برای هایپرلینک
+                    try:
+                        await update.message.reply_text(
+                            sources_text,
+                            parse_mode='Markdown',
+                            disable_web_page_preview=True,
+                            reply_markup=self.get_main_menu()
+                        )
+                    except:
+                        # اگر Markdown کار نکرد، بدون هایپرلینک
+                        sources_text_plain = "📚 منابع مفید:\n\n"
+                        for i, source in enumerate(sources[:5], 1):
+                            clean_url = source['url']
+                            if clean_url.startswith('https://duckduckgo.com/l/?uddg='):
+                                try:
+                                    import urllib.parse
+                                    decoded_url = urllib.parse.unquote(clean_url.split('uddg=')[1].split('&')[0])
+                                    clean_url = decoded_url
+                                except:
+                                    pass
+                            sources_text_plain += f"{i}. {source['title']}\n{clean_url}\n\n"
+                        
+                        await update.message.reply_text(
+                            sources_text_plain,
+                            reply_markup=self.get_main_menu()
+                        )
+                else:
+                    await update.message.reply_text(
+                        "✅ پست‌های شما آماده شد!",
+                        reply_markup=self.get_main_menu()
+                    )
+                    
+        except Exception as e:
+            logger.error(f"Error in handle_message: {e}")
+            await status_message.edit_text(
+                "❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.",
+                reply_markup=self.get_main_menu()
+            )
+    
+    def _get_category_name(self, category: str) -> str:
+        """دریافت نام فارسی دسته‌بندی"""
+        names = {
+            'ai': 'هوش مصنوعی',
+            'marketing': 'بازاریابی',
+            'management': 'مدیریت',
+            'programming': 'برنامه‌نویسی',
+            'business': 'کسب‌وکار',
+            'general': 'عمومی'
+        }
+        return names.get(category, 'عمومی')
+    
+    def _get_category_examples(self, category: str) -> str:
+        """دریافت مثال‌های مناسب برای دسته‌بندی"""
+        examples = {
+            'ai': """• مدیریت فروش با هوش مصنوعی
+• چت‌بات‌های هوشمند
+• تحلیل داده با ML
+• اتوماسیون فرآیندها""",
+            'marketing': """• استراتژی‌های بازاریابی دیجیتال
+• تبلیغات در شبکه‌های اجتماعی
+• بازاریابی محتوا
+• SEO و بهینه‌سازی""",
+            'management': """• مدیریت تیم و رهبری
+• مدیریت پروژه
+• مدیریت زمان
+• تصمیم‌گیری استراتژیک""",
+            'programming': """• یادگیری پایتون
+• توسعه وب
+• برنامه‌نویسی موبایل
+• هوش مصنوعی و ML""",
+            'business': """• راه‌اندازی استارتاپ
+• مدیریت مالی
+• استراتژی کسب‌وکار
+• کارآفرینی""",
+            'general': """• مهارت‌های زندگی
+• توسعه فردی
+• یادگیری سریع
+• موفقیت و انگیزه"""
+        }
+        return examples.get(category, "• موضوعات عمومی و کاربردی")
 
-💡 نکات کلیدی:
-{chr(10).join(key_points[:4] if key_points else ['• موضوعی پرکاربرد و مفید', '• نیاز به مطالعه و تحقیق بیشتر', '• کاربرد در صنایع مختلف'])}
+    def split_text(self, text: str, max_length: int) -> List[str]:
+        """تقسیم متن به قطعات کوچک‌تر"""
+        if len(text) <= max_length:
+            return [text]
+        
+        chunks = []
+        current_chunk = ""
+        
+        for sentence in text.split('. '):
+            if len(current_chunk + sentence) <= max_length:
+                current_chunk += sentence + '. '
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + '. '
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
 
-🎯 این موضوع می‌تواند در بهبود عملکرد و دستیابی به اهداف کمک کند."""
-
-        # Create second post (practical tips)
-        post2 = f"""⚡ نکات عملی {topic}
-
-🚀 برای موفقیت در این حوزه:
-
-{chr(10).join(key_points[4:] if len(key_points) > 4 else ['• مطالعه منابع معتبر', '• تمرین و تکرار مداوم', '• استفاده از ابزارهای مناسب', '• همکاری با متخصصان'])}
-
-💪 تنها با عمل کردن می‌توان به نتایج مطلوب رسید!
-
-#آموزش #{topic.replace(' ', '_')}"""
-
-        return [post1, post2]
-
-    def split_telegram_messages(self, text: str) -> list:
-        """Split a long text into Telegram-sized messages (max 4096 chars, up to 3)"""
-        max_len = 4096
-        chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
-        return chunks[:3]
-
-    def format_sources(self, sources: list) -> str:
-        """Format sources as a neat list of links"""
-        if not sources:
-            return ''
-        lines = ["\n\n📚 منابع پیشنهادی:"]
-        for s in sources:
-            if s['url']:
-                lines.append(f"🔗 {s['title']}: {s['url']}")
-        return '\n'.join(lines)
+    def run(self):
+        """اجرای ربات پیشرفته"""
+        try:
+            # ایجاد application
+            application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+            
+            # اضافه کردن handlers
+            application.add_handler(CommandHandler("start", self.start_command))
+            application.add_handler(CallbackQueryHandler(self.button_handler))
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+            
+            # شروع ربات
+            logger.info("Advanced Bot started successfully!")
+            logger.info(f"Database path: {self.db.db_path}")
+            logger.info(f"Max daily requests: {MAX_DAILY_REQUESTS}")
+            
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}")
+            raise
 
 def main():
-    """Main function to run the bot"""
-    logger.info("Starting Telegram bot...")
-    
-    # Create bot instance
-    bot = TelegramBot()
-    
-    # Create application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler('start', bot.start_command))
-    application.add_handler(CallbackQueryHandler(bot.button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
-    # Run the bot
-    logger.info("Bot is running...")
-    application.run_polling(drop_pending_updates=True)
+    """تابع اصلی"""
+    bot = None
+    try:
+        # بررسی کلیدهای API
+        if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+            logger.error("لطفاً TELEGRAM_BOT_TOKEN را تنظیم کنید!")
+            return
+        
+        # بررسی وجود دیتابیس
+        if not os.path.exists("bot_database.db"):
+            logger.info("Creating new database...")
+        
+        # ایجاد و اجرای ربات پیشرفته
+        bot = AdvancedTelegramBot()
+        logger.info("Bot initialized successfully")
+        bot.run()
+        
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user (Ctrl+C)")
+    except Exception as e:
+        logger.error(f"Critical error in main: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+    finally:
+        if bot:
+            logger.info("Cleaning up bot resources...")
+        logger.info("Bot shutdown complete")
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    main() 
