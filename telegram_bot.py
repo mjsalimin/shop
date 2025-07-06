@@ -20,7 +20,7 @@ TELEGRAM_BOT_TOKEN = "1951771121:AAHxdMix9xAR6a592sTZKC6aBArdfIaLwco"
 METIS_API_KEY = "tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm"
 METIS_BOT_ID = "30f054f0-2363-4128-b6c6-308efc31c5d9"
 METIS_MODEL = "gpt-4o"
-API_URL_METIS = "https://api.metisai.ir/api/chat"
+METIS_BASE_URL = "https://api.metisai.ir"
 
 # تنظیمات
 RETRY_ATTEMPTS = 3
@@ -849,7 +849,91 @@ class MetisAPI:
         self.api_key = api_key
         self.bot_id = bot_id
         self.model = model
-        self.api_url = API_URL_METIS
+        self.base_url = METIS_BASE_URL
+        self.conversation_id = None
+
+    async def create_conversation(self, session: aiohttp.ClientSession) -> str:
+        """ایجاد گفتگوی جدید با ربات"""
+        try:
+            url = f"{self.base_url}/api/conversations"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "botId": self.bot_id,
+                "title": f"Educational Content Generation - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            }
+            
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status == 201:
+                    data = await response.json()
+                    self.conversation_id = data.get('id')
+                    logger.info(f"Conversation created: {self.conversation_id}")
+                    return self.conversation_id
+                else:
+                    logger.error(f"Failed to create conversation: {response.status}")
+                    raise RetryableError("خطا در ایجاد گفتگو")
+                    
+        except Exception as e:
+            logger.error(f"Error creating conversation: {e}")
+            raise RetryableError(f"خطا در ایجاد گفتگو: {str(e)}")
+
+    @retry(
+        retry=retry_if_exception_type(RetryableError),
+        wait=wait_fixed(RETRY_WAIT_SECONDS),
+        stop=stop_after_attempt(RETRY_ATTEMPTS)
+    )
+    async def send_message(self, session: aiohttp.ClientSession, message: str) -> str:
+        """ارسال پیام به ربات و دریافت پاسخ"""
+        try:
+            if not self.conversation_id:
+                await self.create_conversation(session)
+            
+            url = f"{self.base_url}/api/conversations/{self.conversation_id}/messages"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "content": message,
+                "role": "user"
+            }
+            
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status == 201:
+                    data = await response.json()
+                    # دریافت پاسخ ربات
+                    return await self.get_bot_response(session, data.get('id'))
+                else:
+                    logger.error(f"Failed to send message: {response.status}")
+                    raise RetryableError("خطا در ارسال پیام")
+                    
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            raise RetryableError(f"خطا در ارسال پیام: {str(e)}")
+
+    async def get_bot_response(self, session: aiohttp.ClientSession, message_id: str) -> str:
+        """دریافت پاسخ ربات"""
+        try:
+            url = f"{self.base_url}/api/conversations/{self.conversation_id}/messages/{message_id}/response"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}"
+            }
+            
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('content', '')
+                else:
+                    logger.error(f"Failed to get bot response: {response.status}")
+                    raise RetryableError("خطا در دریافت پاسخ ربات")
+                    
+        except Exception as e:
+            logger.error(f"Error getting bot response: {e}")
+            raise RetryableError(f"خطا در دریافت پاسخ ربات: {str(e)}")
 
     @retry(
         retry=retry_if_exception_type(RetryableError),
@@ -863,103 +947,35 @@ class MetisAPI:
             if len(research_content) > 2000:
                 research_content = research_content[:2000] + "..."
             
-            system_prompt = """تو یک متخصص تولید محتوای آموزشی هستی. وظیفه‌ات:
-
-1. محتوای آموزشی علمی و کاربردی بنویس
-2. لحن دوستانه و آموزشی استفاده کن
-3. از اطلاعات تحقیق استفاده کن
-4. محتوا باید برای یادگیری مفید باشد
-5. مثال‌های عملی و واقعی بیاور
-6. از ایموجی مناسب استفاده کن
-7. محتوا را به دو بخش تقسیم کن:
-   - بخش اول: معرفی و تعریف موضوع
-   - بخش دوم: کاربردهای عملی و نکات کلیدی
-
-قالب خروجی:
-[بخش اول]
-محتوای معرفی
-
-[بخش دوم]
-محتوای کاربردی"""
-            
-            user_prompt = f"""موضوع: {topic}
+            # ایجاد پیام آموزشی
+            educational_prompt = f"""موضوع: {topic}
 
 اطلاعات تحقیق: {research_content}
 
-لطفاً محتوای آموزشی علمی و کاربردی بنویس که کاربر بتواند از آن یاد بگیرد و استفاده کند."""
+لطفاً محتوای آموزشی علمی و کاربردی بنویس که شامل موارد زیر باشد:
+
+1. معرفی و تعریف موضوع
+2. کاربردهای عملی و واقعی
+3. نکات کلیدی و مهم
+4. مثال‌های کاربردی
+5. مزایا و چالش‌ها
+
+محتوا را به دو بخش تقسیم کن:
+[بخش اول] - معرفی و مفاهیم
+[بخش دوم] - کاربردهای عملی و نکات کلیدی
+
+از ایموجی مناسب استفاده کن و لحن آموزشی و دوستانه داشته باش."""
             
-            # فرمت صحیح برای Metis console API
-            payload = {
-                "botId": self.bot_id,
-                "message": user_prompt,
-                "systemPrompt": system_prompt,
-                "model": self.model,
-                "temperature": 0.7,
-                "maxTokens": 1500
-            }
+            logger.info(f"Generating educational content for topic: {topic}")
             
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "TelegramBot/1.0",
-                "Accept": "application/json"
-            }
+            # ارسال پیام به ربات متیس
+            response = await self.send_message(session, educational_prompt)
             
-            logger.info(f"Sending request to Metis API for topic: {topic}")
+            if not response:
+                raise RetryableError("پاسخ خالی از ربات")
             
-            async with session.post(
-                self.api_url,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=90),
-                ssl=True
-            ) as response:
-                logger.info(f"Metis API response status: {response.status}")
-                response_text = await response.text()
-                
-                if response.status == 401:
-                    logger.error("Authentication failed - check API key")
-                    raise RetryableError("کلید API معتبر نیست")
-                elif response.status == 403:
-                    logger.error("Access forbidden")
-                    raise RetryableError("دسترسی محدود شده است")
-                elif response.status >= 500:
-                    logger.error(f"Server error: {response.status}")
-                    raise RetryableError("خطای سرور")
-                elif response.status != 200:
-                    logger.error(f"Unexpected status: {response.status}")
-                    raise RetryableError(f"خطای غیرمنتظره: {response.status}")
-                
-                try:
-                    data = json.loads(response_text)
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
-                    raise RetryableError("پاسخ قابل خواندن نیست")
-                
-                # بررسی فرمت پاسخ Metis console API
-                if not isinstance(data, dict):
-                    logger.error(f"Invalid response format: {data}")
-                    raise RetryableError("فرمت پاسخ نامعتبر است")
-                
-                # بررسی فیلدهای مختلف پاسخ
-                content = None
-                if 'response' in data:
-                    content = data['response']
-                elif 'message' in data:
-                    content = data['message']
-                elif 'content' in data:
-                    content = data['content']
-                elif 'choices' in data:
-                    choices = data.get('choices', [])
-                    if choices:
-                        content = choices[0].get('message', {}).get('content', '')
-                
-                if not content:
-                    logger.error(f"No content found in response: {data}")
-                    raise RetryableError("محتوای پاسخ خالی است")
-                
-                logger.info(f"Generated content length: {len(content)}")
-                return content
+            logger.info(f"Generated content length: {len(response)}")
+            return response
                 
         except RetryableError:
             raise
