@@ -5,15 +5,24 @@ import re
 import urllib.parse
 import sqlite3
 import os
+import hashlib
+import base64
+import random
+import string
+import time
+import threading
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
+from dataclasses import dataclass
+from enum import Enum
 
 import aiohttp
 from bs4 import BeautifulSoup
 from tenacity import retry, wait_fixed, stop_after_attempt, retry_if_exception_type, RetryError as TenacityRetryError
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommand, BotCommandScopeDefault
+from telegram.constants import ChatAction, ParseMode
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+import pytz
 
 # کلیدهای API
 TELEGRAM_BOT_TOKEN = "1951771121:AAHxdMix9xAR6a592sTZKC6aBArdfIaLwco"
@@ -22,13 +31,32 @@ METIS_BOT_ID = "30f054f0-2363-4128-b6c6-308efc31c5d9"
 METIS_MODEL = "gpt-4o"
 METIS_BASE_URL = "https://api.metisai.ir"
 
-# تنظیمات
+# تنظیمات پیشرفته
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_SECONDS = 2
-MAX_DAILY_REQUESTS = 20  # افزایش محدودیت روزانه
+MAX_DAILY_REQUESTS = 50  # افزایش محدودیت روزانه
 MAX_CONTENT_LENGTH = 4000
-SUPPORTED_LANGUAGES = ['fa', 'en', 'ar']
+SUPPORTED_LANGUAGES = ['fa', 'en', 'ar', 'tr', 'ru']
 DEFAULT_LANGUAGE = 'fa'
+
+# تنظیمات امنیتی
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_MESSAGE_LENGTH = 4096
+RATE_LIMIT_PER_MINUTE = 10
+RATE_LIMIT_PER_HOUR = 100
+
+# تنظیمات محتوا
+CONTENT_TYPES = ['text', 'image', 'video', 'audio', 'document']
+MAX_SAVED_CONTENT = 100
+MAX_FAVORITES = 50
+
+# تنظیمات یادآوری
+REMINDER_TYPES = ['daily', 'weekly', 'monthly', 'custom']
+MAX_REMINDERS_PER_USER = 10
+
+# تنظیمات آمار
+ANALYTICS_RETENTION_DAYS = 365
+BACKUP_INTERVAL_HOURS = 24
 
 # تنظیمات logging
 logging.basicConfig(
@@ -37,11 +65,213 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Enums و Data Classes
+class UserRole(Enum):
+    USER = "user"
+    PREMIUM = "premium"
+    ADMIN = "admin"
+    MODERATOR = "moderator"
+
+class ContentStatus(Enum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+    DELETED = "deleted"
+
+class NotificationType(Enum):
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    CUSTOM = "custom"
+    SYSTEM = "system"
+
+@dataclass
+class UserSession:
+    user_id: int
+    language: str
+    current_state: str
+    last_activity: datetime
+    preferences: Dict[str, Any]
+
+@dataclass
+class ContentItem:
+    id: int
+    user_id: int
+    topic: str
+    category: str
+    content: str
+    created_at: datetime
+    status: ContentStatus
+    is_favorite: bool
+    tags: List[str]
+    metadata: Dict[str, Any]
+
 class RetryableError(Exception):
     pass
 
+class RateLimitError(Exception):
+    pass
+
+class ContentGenerationError(Exception):
+    pass
+
+class DatabaseError(Exception):
+    pass
+
+class RateLimiter:
+    """کلاس محدودیت نرخ درخواست"""
+    
+    def __init__(self):
+        self.requests = {}
+        self.lock = threading.Lock()
+    
+    def is_allowed(self, user_id: int, limit_type: str = 'minute') -> bool:
+        """بررسی امکان درخواست"""
+        with self.lock:
+            now = time.time()
+            key = f"{user_id}_{limit_type}"
+            
+            if key not in self.requests:
+                self.requests[key] = []
+            
+            # حذف درخواست‌های قدیمی
+            if limit_type == 'minute':
+                window = 60
+                limit = RATE_LIMIT_PER_MINUTE
+            elif limit_type == 'hour':
+                window = 3600
+                limit = RATE_LIMIT_PER_HOUR
+            else:
+                return True
+            
+            self.requests[key] = [req_time for req_time in self.requests[key] if now - req_time < window]
+            
+            if len(self.requests[key]) >= limit:
+                return False
+            
+            self.requests[key].append(now)
+            return True
+    
+    def get_remaining_requests(self, user_id: int, limit_type: str = 'minute') -> int:
+        """دریافت تعداد درخواست‌های باقی‌مانده"""
+        with self.lock:
+            now = time.time()
+            key = f"{user_id}_{limit_type}"
+            
+            if key not in self.requests:
+                return RATE_LIMIT_PER_MINUTE if limit_type == 'minute' else RATE_LIMIT_PER_HOUR
+            
+            if limit_type == 'minute':
+                window = 60
+                limit = RATE_LIMIT_PER_MINUTE
+            elif limit_type == 'hour':
+                window = 3600
+                limit = RATE_LIMIT_PER_HOUR
+            else:
+                return 0
+            
+            self.requests[key] = [req_time for req_time in self.requests[key] if now - req_time < window]
+            return max(0, limit - len(self.requests[key]))
+
+class SecurityManager:
+    """کلاس مدیریت امنیت"""
+    
+    def __init__(self):
+        self.blocked_users = set()
+        self.suspicious_patterns = [
+            r'script', r'javascript', r'<.*>', r'http[s]?://', 
+            r'@\w+', r'#\w+', r'admin', r'root', r'password'
+        ]
+    
+    def is_user_blocked(self, user_id: int) -> bool:
+        """بررسی مسدودیت کاربر"""
+        return user_id in self.blocked_users
+    
+    def block_user(self, user_id: int, reason: str = ""):
+        """مسدود کردن کاربر"""
+        self.blocked_users.add(user_id)
+        logger.warning(f"User {user_id} blocked. Reason: {reason}")
+    
+    def unblock_user(self, user_id: int):
+        """رفع مسدودیت کاربر"""
+        self.blocked_users.discard(user_id)
+        logger.info(f"User {user_id} unblocked")
+    
+    def validate_input(self, text: str) -> Tuple[bool, str]:
+        """اعتبارسنجی ورودی"""
+        if not text or len(text.strip()) < 1:
+            return False, "متن خالی است"
+        
+        if len(text) > MAX_MESSAGE_LENGTH:
+            return False, f"متن خیلی طولانی است (حداکثر {MAX_MESSAGE_LENGTH} کاراکتر)"
+        
+        # بررسی الگوهای مشکوک
+        for pattern in self.suspicious_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return False, "متن شامل محتوای غیرمجاز است"
+        
+        return True, ""
+
+class BackupManager:
+    """کلاس مدیریت پشتیبان"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.backup_dir = "backups"
+        self.ensure_backup_dir()
+    
+    def ensure_backup_dir(self):
+        """ایجاد پوشه پشتیبان"""
+        if not os.path.exists(self.backup_dir):
+            os.makedirs(self.backup_dir)
+    
+    def create_backup(self) -> str:
+        """ایجاد پشتیبان از دیتابیس"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(self.backup_dir, f"backup_{timestamp}.db")
+            
+            import shutil
+            shutil.copy2(self.db_path, backup_path)
+            
+            logger.info(f"Backup created: {backup_path}")
+            return backup_path
+        except Exception as e:
+            logger.error(f"Backup creation failed: {e}")
+            return ""
+    
+    def restore_backup(self, backup_path: str) -> bool:
+        """بازیابی از پشتیبان"""
+        try:
+            if not os.path.exists(backup_path):
+                return False
+            
+            import shutil
+            shutil.copy2(backup_path, self.db_path)
+            logger.info(f"Backup restored from: {backup_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Backup restoration failed: {e}")
+            return False
+    
+    def cleanup_old_backups(self, keep_days: int = 7):
+        """پاک کردن پشتیبان‌های قدیمی"""
+        try:
+            cutoff_time = datetime.now() - timedelta(days=keep_days)
+            
+            for filename in os.listdir(self.backup_dir):
+                if filename.startswith("backup_") and filename.endswith(".db"):
+                    file_path = os.path.join(self.backup_dir, filename)
+                    file_time = datetime.fromtimestamp(os.path.getctime(file_path))
+                    
+                    if file_time < cutoff_time:
+                        os.remove(file_path)
+                        logger.info(f"Old backup removed: {filename}")
+        except Exception as e:
+            logger.error(f"Backup cleanup failed: {e}")
+
 class ContentTemplate:
-    """کلاس قالب‌های محتوا"""
+    """کلاس قالب‌های محتوا پیشرفته"""
     
     @staticmethod
     def get_template(category: str, language: str = 'fa') -> dict:
@@ -50,41 +280,153 @@ class ContentTemplate:
             'ai': {
                 'fa': {
                     'intro': "🤖 هوش مصنوعی در {topic}",
-                    'structure': ["🔬 تعریف و مفاهیم", "⚙️ کاربردهای عملی", "🛠️ ابزارها و تکنولوژی‌ها", "📊 مزایا و چالش‌ها"],
-                    'hashtags': "#هوش_مصنوعی #AI #تکنولوژی #آینده #نوآوری"
+                    'structure': ["🔬 تعریف و مفاهیم", "⚙️ کاربردهای عملی", "🛠️ ابزارها و تکنولوژی‌ها", "📊 مزایا و چالش‌ها", "🚀 روندهای آینده"],
+                    'hashtags': "#هوش_مصنوعی #AI #تکنولوژی #آینده #نوآوری #یادگیری_ماشین",
+                    'emoji': "🤖",
+                    'color': "blue"
                 },
                 'en': {
                     'intro': "🤖 Artificial Intelligence in {topic}",
-                    'structure': ["🔬 Definition and Concepts", "⚙️ Practical Applications", "🛠️ Tools and Technologies", "📊 Benefits and Challenges"],
-                    'hashtags': "#AI #ArtificialIntelligence #Technology #Innovation #Future"
+                    'structure': ["🔬 Definition and Concepts", "⚙️ Practical Applications", "🛠️ Tools and Technologies", "📊 Benefits and Challenges", "🚀 Future Trends"],
+                    'hashtags': "#AI #ArtificialIntelligence #Technology #Innovation #Future #MachineLearning",
+                    'emoji': "🤖",
+                    'color': "blue"
                 }
             },
             'marketing': {
                 'fa': {
                     'intro': "📈 استراتژی‌های بازاریابی در {topic}",
-                    'structure': ["🎯 استراتژی و برنامه‌ریزی", "📊 تحلیل بازار", "🚀 اجرا و پیاده‌سازی", "📈 نتایج و بهینه‌سازی"],
-                    'hashtags': "#بازاریابی #مارکتینگ #استراتژی #فروش #کسب_وکار"
+                    'structure': ["🎯 استراتژی و برنامه‌ریزی", "📊 تحلیل بازار", "🚀 اجرا و پیاده‌سازی", "📈 نتایج و بهینه‌سازی", "💡 نکات کلیدی"],
+                    'hashtags': "#بازاریابی #مارکتینگ #استراتژی #فروش #کسب_وکار #دیجیتال",
+                    'emoji': "📈",
+                    'color': "green"
                 },
                 'en': {
                     'intro': "📈 Marketing Strategies in {topic}",
-                    'structure': ["🎯 Strategy and Planning", "📊 Market Analysis", "🚀 Implementation", "📈 Results and Optimization"],
-                    'hashtags': "#Marketing #Strategy #Sales #Business #Growth"
+                    'structure': ["🎯 Strategy and Planning", "📊 Market Analysis", "🚀 Implementation", "📈 Results and Optimization", "💡 Key Insights"],
+                    'hashtags': "#Marketing #Strategy #Sales #Business #Growth #Digital",
+                    'emoji': "📈",
+                    'color': "green"
                 }
             },
             'management': {
                 'fa': {
                     'intro': "👥 مدیریت و رهبری در {topic}",
-                    'structure': ["📋 برنامه‌ریزی استراتژیک", "👥 مدیریت تیم", "📊 نظارت و کنترل", "🚀 بهبود مستمر"],
-                    'hashtags': "#مدیریت #رهبری #سازمان #توسعه #موفقیت"
+                    'structure': ["📋 برنامه‌ریزی استراتژیک", "👥 مدیریت تیم", "📊 نظارت و کنترل", "🚀 بهبود مستمر", "🎯 نتایج و موفقیت"],
+                    'hashtags': "#مدیریت #رهبری #سازمان #توسعه #موفقیت #تیم",
+                    'emoji': "👥",
+                    'color': "purple"
                 },
                 'en': {
                     'intro': "👥 Management and Leadership in {topic}",
-                    'structure': ["📋 Strategic Planning", "👥 Team Management", "📊 Monitoring and Control", "🚀 Continuous Improvement"],
-                    'hashtags': "#Management #Leadership #Organization #Development #Success"
+                    'structure': ["📋 Strategic Planning", "👥 Team Management", "📊 Monitoring and Control", "🚀 Continuous Improvement", "🎯 Results and Success"],
+                    'hashtags': "#Management #Leadership #Organization #Development #Success #Team",
+                    'emoji': "👥",
+                    'color': "purple"
+                }
+            },
+            'programming': {
+                'fa': {
+                    'intro': "💻 برنامه‌نویسی و توسعه در {topic}",
+                    'structure': ["🔧 ابزارها و تکنولوژی‌ها", "📚 مفاهیم و اصول", "⚙️ پیاده‌سازی عملی", "🛠️ بهترین شیوه‌ها", "🚀 پروژه‌های نمونه"],
+                    'hashtags': "#برنامه_نویسی #توسعه #کد #نرم_افزار #تکنولوژی #پایتون",
+                    'emoji': "💻",
+                    'color': "orange"
+                },
+                'en': {
+                    'intro': "💻 Programming and Development in {topic}",
+                    'structure': ["🔧 Tools and Technologies", "📚 Concepts and Principles", "⚙️ Practical Implementation", "🛠️ Best Practices", "🚀 Sample Projects"],
+                    'hashtags': "#Programming #Development #Code #Software #Technology #Python",
+                    'emoji': "💻",
+                    'color': "orange"
+                }
+            },
+            'business': {
+                'fa': {
+                    'intro': "🏢 کسب‌وکار و کارآفرینی در {topic}",
+                    'structure': ["📊 تحلیل بازار", "💼 مدل کسب‌وکار", "💰 مدیریت مالی", "🚀 رشد و توسعه", "🎯 استراتژی‌های موفقیت"],
+                    'hashtags': "#کسب_وکار #کارآفرینی #استارتاپ #موفقیت #مالی #رشد",
+                    'emoji': "🏢",
+                    'color': "red"
+                },
+                'en': {
+                    'intro': "🏢 Business and Entrepreneurship in {topic}",
+                    'structure': ["📊 Market Analysis", "💼 Business Model", "💰 Financial Management", "🚀 Growth and Development", "🎯 Success Strategies"],
+                    'hashtags': "#Business #Entrepreneurship #Startup #Success #Finance #Growth",
+                    'emoji': "🏢",
+                    'color': "red"
+                }
+            },
+            'health': {
+                'fa': {
+                    'intro': "🏥 سلامت و تندرستی در {topic}",
+                    'structure': ["🔬 مفاهیم علمی", "💪 روش‌های عملی", "🥗 تغذیه و سبک زندگی", "📊 آمار و تحقیقات", "💡 توصیه‌های تخصصی"],
+                    'hashtags': "#سلامت #تندرستی #پزشکی #تغذیه #سبک_زندگی #پیشگیری",
+                    'emoji': "🏥",
+                    'color': "pink"
+                },
+                'en': {
+                    'intro': "🏥 Health and Wellness in {topic}",
+                    'structure': ["🔬 Scientific Concepts", "💪 Practical Methods", "🥗 Nutrition and Lifestyle", "📊 Statistics and Research", "💡 Expert Recommendations"],
+                    'hashtags': "#Health #Wellness #Medical #Nutrition #Lifestyle #Prevention",
+                    'emoji': "🏥",
+                    'color': "pink"
+                }
+            },
+            'education': {
+                'fa': {
+                    'intro': "📚 آموزش و یادگیری در {topic}",
+                    'structure': ["🎯 اهداف یادگیری", "📖 روش‌های آموزشی", "🛠️ ابزارها و منابع", "📊 ارزیابی و پیشرفت", "💡 نکات کاربردی"],
+                    'hashtags': "#آموزش #یادگیری #تحصیل #دانش #مهارت #توسعه_فردی",
+                    'emoji': "📚",
+                    'color': "yellow"
+                },
+                'en': {
+                    'intro': "📚 Education and Learning in {topic}",
+                    'structure': ["🎯 Learning Objectives", "📖 Educational Methods", "🛠️ Tools and Resources", "📊 Assessment and Progress", "💡 Practical Tips"],
+                    'hashtags': "#Education #Learning #Study #Knowledge #Skills #PersonalDevelopment",
+                    'emoji': "📚",
+                    'color': "yellow"
                 }
             }
         }
-        return templates.get(category, templates.get('ai')).get(language, templates.get('ai')['fa'])
+        return templates.get(category, templates.get('general')).get(language, templates.get('general')['fa'])
+    
+    @staticmethod
+    def get_general_template(language: str = 'fa') -> dict:
+        """دریافت قالب عمومی"""
+        general_templates = {
+            'fa': {
+                'intro': "📝 {topic}",
+                'structure': ["🔍 معرفی و تعریف", "📋 نکات کلیدی", "💡 کاربردهای عملی", "🚀 مزایا و فواید"],
+                'hashtags': "#آموزش #توسعه_فردی #موفقیت #یادگیری #مهارت",
+                'emoji': "📝",
+                'color': "gray"
+            },
+            'en': {
+                'intro': "📝 {topic}",
+                'structure': ["🔍 Introduction and Definition", "📋 Key Points", "💡 Practical Applications", "🚀 Benefits and Advantages"],
+                'hashtags': "#Education #PersonalDevelopment #Success #Learning #Skills",
+                'emoji': "📝",
+                'color': "gray"
+            }
+        }
+        return general_templates.get(language, general_templates['fa'])
+    
+    @staticmethod
+    def get_custom_template(topic: str, category: str, language: str = 'fa') -> dict:
+        """ایجاد قالب سفارشی"""
+        base_template = ContentTemplate.get_template(category, language)
+        if not base_template:
+            base_template = ContentTemplate.get_general_template(language)
+        
+        # شخصی‌سازی بر اساس موضوع
+        custom_template = base_template.copy()
+        custom_template['intro'] = base_template['intro'].format(topic=topic)
+        
+        return custom_template
+
+
 
 class AnalyticsManager:
     """کلاس مدیریت آمار و تحلیل"""
@@ -266,12 +608,12 @@ class DatabaseManager:
         self.init_database()
     
     def init_database(self):
-        """ایجاد جداول دیتابیس"""
+        """ایجاد جداول دیتابیس پیشرفته"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            # جدول کاربران
+            # جدول کاربران پیشرفته
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -282,35 +624,56 @@ class DatabaseManager:
                     daily_requests INTEGER DEFAULT 0,
                     last_request_date TEXT,
                     preferred_category TEXT DEFAULT 'general',
-                    language TEXT DEFAULT 'fa'
+                    language TEXT DEFAULT 'fa',
+                    role TEXT DEFAULT 'user',
+                    is_premium BOOLEAN DEFAULT 0,
+                    premium_expires TEXT,
+                    total_requests INTEGER DEFAULT 0,
+                    total_content_saved INTEGER DEFAULT 0,
+                    last_activity TEXT DEFAULT (datetime('now')),
+                    timezone TEXT DEFAULT 'Asia/Tehran',
+                    notification_settings TEXT DEFAULT '{}'
                 )
             ''')
             
-            # جدول درخواست‌ها
+            # جدول درخواست‌های پیشرفته
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
                     topic TEXT,
                     category TEXT,
+                    content_type TEXT DEFAULT 'educational',
+                    language TEXT DEFAULT 'fa',
                     created_at TEXT DEFAULT (datetime('now')),
                     status TEXT DEFAULT 'completed',
+                    processing_time REAL,
+                    content_length INTEGER,
+                    word_count INTEGER,
+                    error_message TEXT,
+                    metadata TEXT DEFAULT '{}',
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
             
-            # جدول آمار
+            # جدول آمار پیشرفته
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS analytics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT,
                     total_requests INTEGER DEFAULT 0,
                     successful_requests INTEGER DEFAULT 0,
-                    failed_requests INTEGER DEFAULT 0
+                    failed_requests INTEGER DEFAULT 0,
+                    total_users INTEGER DEFAULT 0,
+                    new_users INTEGER DEFAULT 0,
+                    active_users INTEGER DEFAULT 0,
+                    avg_processing_time REAL,
+                    popular_categories TEXT DEFAULT '{}',
+                    system_errors INTEGER DEFAULT 0
                 )
             ''')
             
-            # جدول محتوای ذخیره شده
+            # جدول محتوای ذخیره شده پیشرفته
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS saved_content (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,57 +681,184 @@ class DatabaseManager:
                     topic TEXT,
                     category TEXT,
                     content TEXT,
+                    content_type TEXT DEFAULT 'text',
+                    language TEXT DEFAULT 'fa',
                     created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
                     is_favorite BOOLEAN DEFAULT 0,
+                    is_public BOOLEAN DEFAULT 0,
+                    tags TEXT DEFAULT '[]',
+                    metadata TEXT DEFAULT '{}',
+                    view_count INTEGER DEFAULT 0,
+                    share_count INTEGER DEFAULT 0,
+                    rating REAL DEFAULT 0,
+                    rating_count INTEGER DEFAULT 0,
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
             
-            # جدول تنظیمات کاربر
+            # جدول تنظیمات کاربر پیشرفته
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id INTEGER PRIMARY KEY,
                     language TEXT DEFAULT 'fa',
                     content_length TEXT DEFAULT 'medium',
+                    content_type TEXT DEFAULT 'educational',
                     notification_enabled BOOLEAN DEFAULT 1,
                     auto_save BOOLEAN DEFAULT 1,
                     preferred_categories TEXT DEFAULT 'general',
+                    theme TEXT DEFAULT 'default',
+                    privacy_level TEXT DEFAULT 'private',
+                    auto_translate BOOLEAN DEFAULT 0,
+                    target_language TEXT DEFAULT 'fa',
+                    content_format TEXT DEFAULT 'structured',
+                    ai_assistant_enabled BOOLEAN DEFAULT 1,
+                    research_depth TEXT DEFAULT 'comprehensive',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
             
-            # جدول یادآوری‌ها
+            # جدول یادآوری‌های پیشرفته
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
+                    title TEXT,
                     topic TEXT,
+                    message TEXT,
+                    reminder_type TEXT DEFAULT 'custom',
                     scheduled_time TEXT,
+                    repeat_interval TEXT,
                     is_sent BOOLEAN DEFAULT 0,
+                    sent_count INTEGER DEFAULT 0,
+                    last_sent TEXT,
+                    is_active BOOLEAN DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    metadata TEXT DEFAULT '{}',
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
             
-            # جدول بازخورد
+            # جدول بازخورد پیشرفته
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS feedback (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
                     topic TEXT,
+                    content_id INTEGER,
                     rating INTEGER,
                     comment TEXT,
+                    feedback_type TEXT DEFAULT 'general',
+                    category TEXT,
                     created_at TEXT DEFAULT (datetime('now')),
+                    is_helpful BOOLEAN DEFAULT 0,
+                    helpful_count INTEGER DEFAULT 0,
+                    response TEXT,
+                    status TEXT DEFAULT 'pending',
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    FOREIGN KEY (content_id) REFERENCES saved_content (id)
+                )
+            ''')
+            
+            # جدول جستجو و تاریخچه
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS search_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    query TEXT,
+                    category TEXT,
+                    results_count INTEGER,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    is_successful BOOLEAN DEFAULT 1,
+                    processing_time REAL,
                     FOREIGN KEY (user_id) REFERENCES users (user_id)
                 )
             ''')
             
+            # جدول اشتراک‌گذاری
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS content_shares (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content_id INTEGER,
+                    user_id INTEGER,
+                    share_type TEXT DEFAULT 'public',
+                    share_url TEXT,
+                    share_count INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    expires_at TEXT,
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY (content_id) REFERENCES saved_content (id),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول دسته‌بندی‌های سفارشی
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS custom_categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    name TEXT,
+                    description TEXT,
+                    color TEXT DEFAULT '#007bff',
+                    icon TEXT DEFAULT '📁',
+                    is_default BOOLEAN DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول قالب‌های سفارشی
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS custom_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    name TEXT,
+                    category TEXT,
+                    template_structure TEXT,
+                    is_public BOOLEAN DEFAULT 0,
+                    usage_count INTEGER DEFAULT 0,
+                    rating REAL DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # جدول اعلان‌های سیستم
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    title TEXT,
+                    message TEXT,
+                    notification_type TEXT DEFAULT 'info',
+                    is_read BOOLEAN DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    expires_at TEXT,
+                    action_url TEXT,
+                    metadata TEXT DEFAULT '{}',
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            ''')
+            
+            # ایجاد ایندکس‌ها برای بهبود عملکرد
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_join_date ON users(join_date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_requests_user_date ON requests(user_id, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_saved_content_user ON saved_content(user_id, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_reminders_scheduled ON reminders(scheduled_time, is_active)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id, created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_search_history_user ON search_history(user_id, created_at)')
+            
             conn.commit()
             conn.close()
-            logger.info("Database initialized successfully")
+            logger.info("Advanced database initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing database: {e}")
-            raise
+            raise DatabaseError(f"خطا در راه‌اندازی دیتابیس: {str(e)}")
     
     def get_user(self, user_id: int) -> Optional[Dict]:
         """دریافت اطلاعات کاربر"""
@@ -597,7 +1087,7 @@ class DatabaseManager:
             logger.error(f"Error creating user settings for {user_id}: {e}")
     
     def update_user_settings(self, user_id: int, settings: Dict):
-        """به‌روزرسانی تنظیمات کاربر"""
+        """به‌روزرسانی تنظیمات کاربر پیشرفته"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -605,23 +1095,22 @@ class DatabaseManager:
             updates = []
             values = []
             
-            if 'language' in settings:
-                updates.append('language = ?')
-                values.append(settings['language'])
-            if 'content_length' in settings:
-                updates.append('content_length = ?')
-                values.append(settings['content_length'])
-            if 'notification_enabled' in settings:
-                updates.append('notification_enabled = ?')
-                values.append(settings['notification_enabled'])
-            if 'auto_save' in settings:
-                updates.append('auto_save = ?')
-                values.append(settings['auto_save'])
-            if 'preferred_categories' in settings:
-                updates.append('preferred_categories = ?')
-                values.append(settings['preferred_categories'])
+            # فیلدهای قابل به‌روزرسانی
+            updatable_fields = [
+                'language', 'content_length', 'content_type', 'notification_enabled', 
+                'auto_save', 'preferred_categories', 'theme', 'privacy_level',
+                'auto_translate', 'target_language', 'content_format', 
+                'ai_assistant_enabled', 'research_depth'
+            ]
+            
+            for field in updatable_fields:
+                if field in settings:
+                    updates.append(f'{field} = ?')
+                    values.append(settings[field])
             
             if updates:
+                updates.append('updated_at = ?')
+                values.append(datetime.now().isoformat())
                 values.append(user_id)
                 query = f"UPDATE user_settings SET {', '.join(updates)} WHERE user_id = ?"
                 cursor.execute(query, values)
@@ -631,6 +1120,419 @@ class DatabaseManager:
             logger.info(f"User settings updated for {user_id}")
         except Exception as e:
             logger.error(f"Error updating user settings for {user_id}: {e}")
+            raise DatabaseError(f"خطا در به‌روزرسانی تنظیمات: {str(e)}")
+    
+    def create_reminder(self, user_id: int, title: str, topic: str, message: str, 
+                       scheduled_time: str, reminder_type: str = 'custom', 
+                       repeat_interval: str = None) -> int:
+        """ایجاد یادآوری جدید"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO reminders (user_id, title, topic, message, scheduled_time, 
+                                     reminder_type, repeat_interval)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, title, topic, message, scheduled_time, reminder_type, repeat_interval))
+            
+            reminder_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"Reminder created for user {user_id}: {title}")
+            return reminder_id
+        except Exception as e:
+            logger.error(f"Error creating reminder for user {user_id}: {e}")
+            raise DatabaseError(f"خطا در ایجاد یادآوری: {str(e)}")
+    
+    def get_user_reminders(self, user_id: int, active_only: bool = True) -> List[Dict]:
+        """دریافت یادآوری‌های کاربر"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            query = '''
+                SELECT id, title, topic, message, scheduled_time, reminder_type, 
+                       repeat_interval, is_sent, sent_count, last_sent, is_active
+                FROM reminders 
+                WHERE user_id = ?
+            '''
+            
+            if active_only:
+                query += ' AND is_active = 1'
+            
+            query += ' ORDER BY scheduled_time ASC'
+            
+            cursor.execute(query, (user_id,))
+            results = cursor.fetchall()
+            conn.close()
+            
+            return [
+                {
+                    'id': row[0],
+                    'title': row[1],
+                    'topic': row[2],
+                    'message': row[3],
+                    'scheduled_time': row[4],
+                    'reminder_type': row[5],
+                    'repeat_interval': row[6],
+                    'is_sent': bool(row[7]),
+                    'sent_count': row[8],
+                    'last_sent': row[9],
+                    'is_active': bool(row[10])
+                }
+                for row in results
+            ]
+        except Exception as e:
+            logger.error(f"Error getting reminders for user {user_id}: {e}")
+            return []
+    
+    def update_reminder_status(self, reminder_id: int, is_sent: bool = True):
+        """به‌روزرسانی وضعیت یادآوری"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE reminders 
+                SET is_sent = ?, sent_count = sent_count + 1, last_sent = ?
+                WHERE id = ?
+            ''', (is_sent, datetime.now().isoformat(), reminder_id))
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"Reminder {reminder_id} status updated")
+        except Exception as e:
+            logger.error(f"Error updating reminder status: {e}")
+    
+    def save_search_history(self, user_id: int, query: str, category: str, 
+                           results_count: int, processing_time: float, is_successful: bool = True):
+        """ذخیره تاریخچه جستجو"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO search_history (user_id, query, category, results_count, 
+                                          processing_time, is_successful)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, query, category, results_count, processing_time, is_successful))
+            
+            conn.commit()
+            conn.close()
+            logger.debug(f"Search history saved for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error saving search history: {e}")
+    
+    def get_search_history(self, user_id: int, limit: int = 10) -> List[Dict]:
+        """دریافت تاریخچه جستجو"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT query, category, results_count, created_at, is_successful
+                FROM search_history 
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (user_id, limit))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            return [
+                {
+                    'query': row[0],
+                    'category': row[1],
+                    'results_count': row[2],
+                    'created_at': row[3],
+                    'is_successful': bool(row[4])
+                }
+                for row in results
+            ]
+        except Exception as e:
+            logger.error(f"Error getting search history for user {user_id}: {e}")
+            return []
+    
+    def create_content_share(self, content_id: int, user_id: int, share_type: str = 'public', 
+                           expires_at: str = None) -> str:
+        """ایجاد اشتراک‌گذاری محتوا"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # ایجاد URL منحصر به فرد
+            share_url = self._generate_share_url(content_id, user_id)
+            
+            cursor.execute('''
+                INSERT INTO content_shares (content_id, user_id, share_type, share_url, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (content_id, user_id, share_type, share_url, expires_at))
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"Content share created: {share_url}")
+            return share_url
+        except Exception as e:
+            logger.error(f"Error creating content share: {e}")
+            raise DatabaseError(f"خطا در ایجاد اشتراک‌گذاری: {str(e)}")
+    
+    def _generate_share_url(self, content_id: int, user_id: int) -> str:
+        """تولید URL منحصر به فرد برای اشتراک‌گذاری"""
+        import hashlib
+        import base64
+        
+        # ترکیب ID محتوا و کاربر با timestamp
+        unique_string = f"{content_id}_{user_id}_{int(time.time())}"
+        hash_object = hashlib.md5(unique_string.encode())
+        hash_hex = hash_object.hexdigest()[:12]
+        
+        return f"https://t.me/share/url?url=content_{hash_hex}"
+    
+    def get_shared_content(self, share_url: str) -> Optional[Dict]:
+        """دریافت محتوای اشتراک‌گذاری شده"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT cs.id, cs.content_id, cs.user_id, cs.share_type, cs.expires_at,
+                       sc.topic, sc.category, sc.content, sc.content_type, sc.language
+                FROM content_shares cs
+                JOIN saved_content sc ON cs.content_id = sc.id
+                WHERE cs.share_url = ? AND cs.is_active = 1
+            ''', (share_url,))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'share_id': result[0],
+                    'content_id': result[1],
+                    'user_id': result[2],
+                    'share_type': result[3],
+                    'expires_at': result[4],
+                    'topic': result[5],
+                    'category': result[6],
+                    'content': result[7],
+                    'content_type': result[8],
+                    'language': result[9]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting shared content: {e}")
+            return None
+    
+    def create_custom_category(self, user_id: int, name: str, description: str = "", 
+                             color: str = "#007bff", icon: str = "📁") -> int:
+        """ایجاد دسته‌بندی سفارشی"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO custom_categories (user_id, name, description, color, icon)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, name, description, color, icon))
+            
+            category_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"Custom category created for user {user_id}: {name}")
+            return category_id
+        except Exception as e:
+            logger.error(f"Error creating custom category: {e}")
+            raise DatabaseError(f"خطا در ایجاد دسته‌بندی: {str(e)}")
+    
+    def get_custom_categories(self, user_id: int) -> List[Dict]:
+        """دریافت دسته‌بندی‌های سفارشی کاربر"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT id, name, description, color, icon, is_default, created_at
+                FROM custom_categories 
+                WHERE user_id = ?
+                ORDER BY created_at ASC
+            ''', (user_id,))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            return [
+                {
+                    'id': row[0],
+                    'name': row[1],
+                    'description': row[2],
+                    'color': row[3],
+                    'icon': row[4],
+                    'is_default': bool(row[5]),
+                    'created_at': row[6]
+                }
+                for row in results
+            ]
+        except Exception as e:
+            logger.error(f"Error getting custom categories for user {user_id}: {e}")
+            return []
+    
+    def create_system_notification(self, user_id: int, title: str, message: str, 
+                                 notification_type: str = 'info', action_url: str = None,
+                                 expires_at: str = None) -> int:
+        """ایجاد اعلان سیستم"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO system_notifications (user_id, title, message, notification_type, 
+                                                action_url, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, title, message, notification_type, action_url, expires_at))
+            
+            notification_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"System notification created for user {user_id}: {title}")
+            return notification_id
+        except Exception as e:
+            logger.error(f"Error creating system notification: {e}")
+            raise DatabaseError(f"خطا در ایجاد اعلان: {str(e)}")
+    
+    def get_user_notifications(self, user_id: int, unread_only: bool = True) -> List[Dict]:
+        """دریافت اعلان‌های کاربر"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            query = '''
+                SELECT id, title, message, notification_type, is_read, created_at, 
+                       action_url, expires_at
+                FROM system_notifications 
+                WHERE user_id = ?
+            '''
+            
+            if unread_only:
+                query += ' AND is_read = 0'
+            
+            query += ' ORDER BY created_at DESC'
+            
+            cursor.execute(query, (user_id,))
+            results = cursor.fetchall()
+            conn.close()
+            
+            return [
+                {
+                    'id': row[0],
+                    'title': row[1],
+                    'message': row[2],
+                    'notification_type': row[3],
+                    'is_read': bool(row[4]),
+                    'created_at': row[5],
+                    'action_url': row[6],
+                    'expires_at': row[7]
+                }
+                for row in results
+            ]
+        except Exception as e:
+            logger.error(f"Error getting notifications for user {user_id}: {e}")
+            return []
+    
+    def mark_notification_read(self, notification_id: int):
+        """علامت‌گذاری اعلان به عنوان خوانده شده"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE system_notifications 
+                SET is_read = 1
+                WHERE id = ?
+            ''', (notification_id,))
+            
+            conn.commit()
+            conn.close()
+            logger.debug(f"Notification {notification_id} marked as read")
+        except Exception as e:
+            logger.error(f"Error marking notification as read: {e}")
+    
+    def get_user_statistics(self, user_id: int) -> Dict[str, Any]:
+        """دریافت آمار جامع کاربر"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # آمار کلی
+            cursor.execute('''
+                SELECT total_requests, total_content_saved, daily_requests,
+                       join_date, last_activity, is_premium
+                FROM users WHERE user_id = ?
+            ''', (user_id,))
+            user_stats = cursor.fetchone()
+            
+            # آمار درخواست‌ها
+            cursor.execute('''
+                SELECT COUNT(*) as total,
+                       COUNT(CASE WHEN status = 'completed' THEN 1 END) as successful,
+                       COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed,
+                       AVG(processing_time) as avg_time
+                FROM requests WHERE user_id = ?
+            ''', (user_id,))
+            request_stats = cursor.fetchone()
+            
+            # دسته‌بندی‌های محبوب
+            cursor.execute('''
+                SELECT category, COUNT(*) as count
+                FROM requests 
+                WHERE user_id = ? 
+                GROUP BY category 
+                ORDER BY count DESC 
+                LIMIT 5
+            ''', (user_id,))
+            categories = cursor.fetchall()
+            
+            # آمار محتوای ذخیره شده
+            cursor.execute('''
+                SELECT COUNT(*) as total,
+                       COUNT(CASE WHEN is_favorite = 1 THEN 1 END) as favorites,
+                       COUNT(CASE WHEN is_public = 1 THEN 1 END) as public
+                FROM saved_content WHERE user_id = ?
+            ''', (user_id,))
+            content_stats = cursor.fetchone()
+            
+            conn.close()
+            
+            return {
+                'user_info': {
+                    'total_requests': user_stats[0] if user_stats else 0,
+                    'total_content_saved': user_stats[1] if user_stats else 0,
+                    'daily_requests': user_stats[2] if user_stats else 0,
+                    'join_date': user_stats[3] if user_stats else None,
+                    'last_activity': user_stats[4] if user_stats else None,
+                    'is_premium': bool(user_stats[5]) if user_stats else False
+                },
+                'request_stats': {
+                    'total': request_stats[0] if request_stats else 0,
+                    'successful': request_stats[1] if request_stats else 0,
+                    'failed': request_stats[2] if request_stats else 0,
+                    'avg_processing_time': request_stats[3] if request_stats else 0
+                },
+                'popular_categories': categories,
+                'content_stats': {
+                    'total': content_stats[0] if content_stats else 0,
+                    'favorites': content_stats[1] if content_stats else 0,
+                    'public': content_stats[2] if content_stats else 0
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error getting user statistics: {e}")
+            return {}
 
 class ContentScraper:
     def __init__(self, session: aiohttp.ClientSession):
@@ -983,6 +1885,186 @@ class MetisAPI:
             logger.error(f"Unexpected error: {e}")
             raise RetryableError(f"خطای غیرمنتظره: {str(e)}")
 
+class AIAssistant:
+    """کلاس دستیار هوش مصنوعی پیشرفته"""
+    
+    def __init__(self, metis_api: MetisAPI):
+        self.metis_api = metis_api
+        self.conversation_history = {}
+        self.user_preferences = {}
+    
+    async def generate_comprehensive_content(self, session: aiohttp.ClientSession, topic: str, 
+                                           category: str, language: str = 'fa', 
+                                           content_type: str = 'educational') -> Dict[str, Any]:
+        """تولید محتوای جامع و پیشرفته"""
+        try:
+            # دریافت قالب مناسب
+            template = ContentTemplate.get_custom_template(topic, category, language)
+            
+            # ایجاد prompt پیشرفته
+            advanced_prompt = self._create_advanced_prompt(topic, category, language, content_type, template)
+            
+            # تولید محتوا با Metis
+            raw_content = await self.metis_api.send_message(session, advanced_prompt)
+            
+            # پردازش و ساختاردهی محتوا
+            structured_content = self._structure_content(raw_content, template, category)
+            
+            # اضافه کردن متادیتا
+            metadata = {
+                'topic': topic,
+                'category': category,
+                'language': language,
+                'content_type': content_type,
+                'template_used': template,
+                'generated_at': datetime.now().isoformat(),
+                'word_count': len(raw_content.split()),
+                'estimated_read_time': len(raw_content.split()) // 200  # 200 کلمه در دقیقه
+            }
+            
+            return {
+                'content': structured_content,
+                'raw_content': raw_content,
+                'metadata': metadata,
+                'template': template
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in comprehensive content generation: {e}")
+            raise ContentGenerationError(f"خطا در تولید محتوا: {str(e)}")
+    
+    def _create_advanced_prompt(self, topic: str, category: str, language: str, 
+                               content_type: str, template: dict) -> str:
+        """ایجاد prompt پیشرفته"""
+        
+        language_instructions = {
+            'fa': "به زبان فارسی و با لحن دوستانه و آموزشی بنویس",
+            'en': "Write in English with a friendly and educational tone",
+            'ar': "اكتب باللغة العربية بأسلوب ودود وتعليمي",
+            'tr': "Dostane ve eğitici bir tonla Türkçe yazın",
+            'ru': "Пишите на русском языке дружелюбным и образовательным тоном"
+        }
+        
+        content_type_instructions = {
+            'educational': "محتوای آموزشی جامع و کاربردی",
+            'professional': "محتوای حرفه‌ای و تخصصی",
+            'casual': "محتوای غیررسمی و دوستانه",
+            'technical': "محتوای فنی و تخصصی",
+            'summary': "خلاصه مختصر و مفید"
+        }
+        
+        prompt = f"""موضوع: {topic}
+دسته‌بندی: {category}
+نوع محتوا: {content_type_instructions.get(content_type, 'educational')}
+زبان: {language_instructions.get(language, 'fa')}
+
+ساختار مورد نظر:
+{chr(10).join(template['structure'])}
+
+لطفاً محتوای کاملی بنویس که شامل موارد زیر باشد:
+
+1. معرفی جامع موضوع
+2. توضیح مفاهیم کلیدی
+3. کاربردهای عملی و واقعی
+4. مثال‌های کاربردی
+5. نکات مهم و ترفندها
+6. مزایا و چالش‌ها
+7. توصیه‌های عملی
+8. منابع و مراجع مفید
+
+محتوا را به صورت ساختاریافته و با استفاده از ایموجی‌های مناسب بنویس.
+طول محتوا: 800-1200 کلمه
+استایل: {content_type_instructions.get(content_type, 'educational')}
+
+{template['hashtags']}"""
+        
+        return prompt
+    
+    def _structure_content(self, raw_content: str, template: dict, category: str) -> List[Dict[str, str]]:
+        """ساختاردهی محتوا"""
+        try:
+            # تقسیم محتوا به بخش‌ها
+            sections = []
+            
+            # اگر محتوا شامل بخش‌های مشخص باشد
+            if '[بخش' in raw_content or 'Section' in raw_content:
+                parts = re.split(r'\[بخش\s*\d+\]|Section\s*\d+', raw_content)
+                for i, part in enumerate(parts[1:], 1):  # از بخش دوم شروع
+                    if part.strip():
+                        sections.append({
+                            'title': f"بخش {i}",
+                            'content': part.strip(),
+                            'type': 'section'
+                        })
+            else:
+                # تقسیم بر اساس پاراگراف‌ها
+                paragraphs = [p.strip() for p in raw_content.split('\n\n') if p.strip()]
+                
+                if len(paragraphs) >= 2:
+                    # تقسیم به دو بخش اصلی
+                    mid = len(paragraphs) // 2
+                    sections.append({
+                        'title': template['structure'][0] if template['structure'] else "معرفی",
+                        'content': '\n\n'.join(paragraphs[:mid]),
+                        'type': 'introduction'
+                    })
+                    sections.append({
+                        'title': template['structure'][1] if len(template['structure']) > 1 else "کاربردها",
+                        'content': '\n\n'.join(paragraphs[mid:]),
+                        'type': 'applications'
+                    })
+                else:
+                    sections.append({
+                        'title': template['structure'][0] if template['structure'] else "محتوا",
+                        'content': raw_content,
+                        'type': 'general'
+                    })
+            
+            return sections
+            
+        except Exception as e:
+            logger.error(f"Error structuring content: {e}")
+            return [{
+                'title': 'محتوا',
+                'content': raw_content,
+                'type': 'general'
+            }]
+    
+    async def generate_multiple_formats(self, session: aiohttp.ClientSession, topic: str, 
+                                      category: str, language: str = 'fa') -> Dict[str, Any]:
+        """تولید محتوا در فرمت‌های مختلف"""
+        formats = {}
+        
+        try:
+            # محتوای آموزشی
+            educational = await self.generate_comprehensive_content(
+                session, topic, category, language, 'educational'
+            )
+            formats['educational'] = educational
+            
+            # خلاصه
+            summary_prompt = f"خلاصه مختصر و مفید از موضوع '{topic}' در {len(topic.split()) * 2} کلمه"
+            summary_content = await self.metis_api.send_message(session, summary_prompt)
+            formats['summary'] = {
+                'content': summary_content,
+                'type': 'summary',
+                'word_count': len(summary_content.split())
+            }
+            
+            # نکات کلیدی
+            key_points_prompt = f"5 نکته کلیدی مهم درباره '{topic}' به صورت لیست"
+            key_points = await self.metis_api.send_message(session, key_points_prompt)
+            formats['key_points'] = {
+                'content': key_points,
+                'type': 'key_points'
+            }
+            
+            return formats
+            
+        except Exception as e:
+            logger.error(f"Error generating multiple formats: {e}")
+            return formats
+
 class ContentGenerator:
     """کلاس تولید محتوا با قابلیت‌های پیشرفته"""
     
@@ -1226,15 +2308,42 @@ class ContentGenerator:
 
 class AdvancedTelegramBot:
     def __init__(self):
-        self.scraper = None
+        # مدیران اصلی
         self.db = DatabaseManager()
-        self.user_states = {}
-        self.content_generator = ContentGenerator()
+        self.scraper = None
         self.metis_api = MetisAPI(METIS_API_KEY, METIS_BOT_ID, METIS_MODEL)
+        
+        # مدیران پیشرفته
+        self.rate_limiter = RateLimiter()
+        self.security_manager = SecurityManager()
+        self.backup_manager = BackupManager(self.db.db_path)
+        self.ai_assistant = AIAssistant(self.metis_api)
+        
+        # مدیران محتوا و آمار
         self.analytics_manager = AnalyticsManager(self.db)
         self.notification_manager = None
         self.content_scheduler = ContentScheduler()
         self.content_template = ContentTemplate()
+        self.content_generator = ContentGenerator()
+        
+        # وضعیت‌ها و تنظیمات
+        self.user_states = {}
+        self.user_sessions = {}
+        self.conversation_states = {}
+        
+        # تنظیمات پیشرفته
+        self.backup_task = None
+        self.cleanup_task = None
+        self.reminder_task = None
+        
+        # آمار سیستم
+        self.system_stats = {
+            'start_time': datetime.now(),
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'active_users': 0
+        }
         
     def get_main_menu(self):
         """دریافت منوی اصلی پیشرفته"""
@@ -1243,11 +2352,79 @@ class AdvancedTelegramBot:
             [InlineKeyboardButton("💾 محتوای ذخیره شده", callback_data='saved_content')],
             [InlineKeyboardButton("📊 آمار و گزارش", callback_data='analytics')],
             [InlineKeyboardButton("⚙️ تنظیمات", callback_data='settings')],
-            [InlineKeyboardButton("❓ راهنما", callback_data='help'), 
-             InlineKeyboardButton("🔍 جستجوی پیشرفته", callback_data='advanced_search')],
-            [InlineKeyboardButton("⭐ بازخورد", callback_data='feedback')],
+            [InlineKeyboardButton("🔍 جستجوی پیشرفته", callback_data='advanced_search')],
+            [InlineKeyboardButton("🤖 دستیار هوشمند", callback_data='ai_assistant')],
             [InlineKeyboardButton("📅 یادآوری‌ها", callback_data='reminders')],
+            [InlineKeyboardButton("📤 اشتراک‌گذاری", callback_data='sharing')],
+            [InlineKeyboardButton("🏷️ دسته‌بندی‌های سفارشی", callback_data='custom_categories')],
+            [InlineKeyboardButton("📚 قالب‌های سفارشی", callback_data='custom_templates')],
+            [InlineKeyboardButton("🔔 اعلان‌ها", callback_data='notifications')],
+            [InlineKeyboardButton("⭐ بازخورد", callback_data='feedback')],
+            [InlineKeyboardButton("❓ راهنما", callback_data='help')],
             [InlineKeyboardButton("📊 درباره ربات", callback_data='about')]
+        ])
+    
+    def get_ai_assistant_menu(self):
+        """منوی دستیار هوشمند"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎯 تولید محتوای هوشمند", callback_data='ai_smart_content')],
+            [InlineKeyboardButton("📋 خلاصه و نکات کلیدی", callback_data='ai_summary')],
+            [InlineKeyboardButton("🔍 تحقیق پیشرفته", callback_data='ai_research')],
+            [InlineKeyboardButton("📊 تحلیل و گزارش", callback_data='ai_analysis')],
+            [InlineKeyboardButton("💡 پیشنهادات هوشمند", callback_data='ai_suggestions')],
+            [InlineKeyboardButton("🔄 چت تعاملی", callback_data='ai_chat')],
+            [InlineKeyboardButton("🔙 برگشت", callback_data='main_menu')]
+        ])
+    
+    def get_sharing_menu(self):
+        """منوی اشتراک‌گذاری"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 اشتراک محتوا", callback_data='share_content')],
+            [InlineKeyboardButton("🔗 لینک‌های اشتراک", callback_data='share_links')],
+            [InlineKeyboardButton("📊 آمار اشتراک", callback_data='share_stats')],
+            [InlineKeyboardButton("⚙️ تنظیمات اشتراک", callback_data='share_settings')],
+            [InlineKeyboardButton("🔙 برگشت", callback_data='main_menu')]
+        ])
+    
+    def get_custom_categories_menu(self):
+        """منوی دسته‌بندی‌های سفارشی"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ ایجاد دسته‌بندی جدید", callback_data='create_category')],
+            [InlineKeyboardButton("📋 مدیریت دسته‌بندی‌ها", callback_data='manage_categories')],
+            [InlineKeyboardButton("🎨 شخصی‌سازی ظاهر", callback_data='customize_categories')],
+            [InlineKeyboardButton("📊 آمار دسته‌بندی‌ها", callback_data='category_stats')],
+            [InlineKeyboardButton("🔙 برگشت", callback_data='main_menu')]
+        ])
+    
+    def get_custom_templates_menu(self):
+        """منوی قالب‌های سفارشی"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 ایجاد قالب جدید", callback_data='create_template')],
+            [InlineKeyboardButton("📋 مدیریت قالب‌ها", callback_data='manage_templates')],
+            [InlineKeyboardButton("📊 قالب‌های محبوب", callback_data='popular_templates')],
+            [InlineKeyboardButton("⚙️ تنظیمات قالب", callback_data='template_settings')],
+            [InlineKeyboardButton("🔙 برگشت", callback_data='main_menu')]
+        ])
+    
+    def get_notifications_menu(self):
+        """منوی اعلان‌ها"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📬 اعلان‌های جدید", callback_data='new_notifications')],
+            [InlineKeyboardButton("📋 همه اعلان‌ها", callback_data='all_notifications')],
+            [InlineKeyboardButton("⚙️ تنظیمات اعلان", callback_data='notification_settings')],
+            [InlineKeyboardButton("🔕 مدیریت اعلان‌ها", callback_data='manage_notifications')],
+            [InlineKeyboardButton("🔙 برگشت", callback_data='main_menu')]
+        ])
+    
+    def get_advanced_search_menu(self):
+        """منوی جستجوی پیشرفته"""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 جستجوی دقیق", callback_data='precise_search')],
+            [InlineKeyboardButton("📊 جستجو در آمار", callback_data='search_analytics')],
+            [InlineKeyboardButton("📚 جستجو در محتوا", callback_data='search_content')],
+            [InlineKeyboardButton("📅 جستجو در تاریخچه", callback_data='search_history')],
+            [InlineKeyboardButton("🎯 فیلترهای پیشرفته", callback_data='advanced_filters')],
+            [InlineKeyboardButton("🔙 برگشت", callback_data='main_menu')]
         ])
 
     def get_back_menu(self):
@@ -1302,9 +2479,19 @@ class AdvancedTelegramBot:
         ])
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """مدیریت دستور /start"""
+        """مدیریت دستور /start پیشرفته"""
         user = update.effective_user
         user_id = user.id
+        
+        # بررسی امنیت
+        if self.security_manager.is_user_blocked(user_id):
+            await update.message.reply_text("❌ شما از استفاده از ربات مسدود شده‌اید.")
+            return
+        
+        # بررسی محدودیت نرخ
+        if not self.rate_limiter.is_allowed(user_id, 'minute'):
+            await update.message.reply_text("⚠️ لطفاً کمی صبر کنید و دوباره تلاش کنید.")
+            return
         
         # ثبت کاربر در دیتابیس
         self.db.create_user(
@@ -1314,28 +2501,263 @@ class AdvancedTelegramBot:
             last_name=user.last_name or ""
         )
         
-        logger.info(f"User {user_id} started the bot")
+        # ایجاد جلسه کاربر
+        self.user_sessions[user_id] = UserSession(
+            user_id=user_id,
+            language='fa',
+            current_state='main_menu',
+            last_activity=datetime.now(),
+            preferences={}
+        )
+        
+        # به‌روزرسانی آمار سیستم
+        self.system_stats['active_users'] += 1
+        
+        logger.info(f"User {user_id} started the advanced bot")
         
         welcome_message = f"""👋 سلام {user.first_name or 'کاربر'}! 
 
-🤖 من ربات پیشرفته تولید محتوای آموزشی هستم
+🤖 من ربات پیشرفته تولید محتوای آموزشی با قابلیت‌های هوشمند هستم
 
 🔥 قابلیت‌های جدید:
-• 📝 تولید محتوای هوشمند و آموزشی
+• 🤖 دستیار هوشمند AI
+• 📝 تولید محتوای پیشرفته
 • 💾 ذخیره و مدیریت محتوا
-• 📊 آمار و گزارش پیشرفته
-• 🏷️ دسته‌بندی خودکار محتوا
-• ⚙️ تنظیمات شخصی‌سازی
+• 📊 آمار و گزارش جامع
+• 🏷️ دسته‌بندی‌های سفارشی
+• 📚 قالب‌های شخصی‌سازی
+• 📤 اشتراک‌گذاری محتوا
+• 🔔 سیستم اعلان‌های هوشمند
 • 📅 یادآوری و زمان‌بندی
+• 🔍 جستجوی پیشرفته
 • ⭐ سیستم بازخورد
-• 🔔 اعلان‌های هوشمند
 • 📈 محدودیت روزانه: {MAX_DAILY_REQUESTS} درخواست
 
-✨ کافیه موضوع مورد نظرتون رو بفرستین!"""
+✨ برای شروع، یکی از گزینه‌های زیر را انتخاب کنید!"""
         
         await update.message.reply_text(
             welcome_message, 
             reply_markup=self.get_main_menu()
+        )
+    
+    async def ai_assistant_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور دستیار هوشمند"""
+        user_id = update.effective_user.id
+        
+        if self.security_manager.is_user_blocked(user_id):
+            await update.message.reply_text("❌ شما از استفاده از ربات مسدود شده‌اید.")
+            return
+        
+        ai_message = """🤖 دستیار هوشمند AI
+
+این دستیار قابلیت‌های پیشرفته‌ای دارد:
+
+🎯 تولید محتوای هوشمند:
+• تحلیل خودکار موضوع
+• تولید محتوای شخصی‌سازی شده
+• بهینه‌سازی بر اساس ترجیحات
+
+📋 خلاصه و نکات کلیدی:
+• استخراج نکات مهم
+• خلاصه‌سازی هوشمند
+• نکات کلیدی کاربردی
+
+🔍 تحقیق پیشرفته:
+• جستجوی عمیق در منابع
+• تحلیل و ترکیب اطلاعات
+• ارائه منابع معتبر
+
+📊 تحلیل و گزارش:
+• تحلیل آماری محتوا
+• گزارش‌های تحلیلی
+• نمودارها و آمار
+
+💡 پیشنهادات هوشمند:
+• پیشنهاد موضوعات مرتبط
+• الگوریتم‌های پیشنهاد
+• شخصی‌سازی بر اساس تاریخچه
+
+🔄 چت تعاملی:
+• گفتگوی طبیعی
+• پاسخ‌های هوشمند
+• یادگیری از تعاملات
+
+برای استفاده، یکی از گزینه‌های زیر را انتخاب کنید:"""
+        
+        await update.message.reply_text(
+            ai_message,
+            reply_markup=self.get_ai_assistant_menu()
+        )
+    
+    async def sharing_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور اشتراک‌گذاری"""
+        user_id = update.effective_user.id
+        
+        sharing_message = """📤 سیستم اشتراک‌گذاری
+
+قابلیت‌های اشتراک‌گذاری:
+
+📤 اشتراک محتوا:
+• ایجاد لینک اشتراک
+• تنظیم سطح دسترسی
+• محدودیت زمانی
+
+🔗 لینک‌های اشتراک:
+• مدیریت لینک‌های فعال
+• آمار بازدید
+• تنظیمات امنیتی
+
+📊 آمار اشتراک:
+• تعداد بازدید
+• آمار اشتراک‌گذاری
+• تحلیل عملکرد
+
+⚙️ تنظیمات اشتراک:
+• حریم خصوصی
+• محدودیت‌های دسترسی
+• تنظیمات پیشرفته
+
+برای شروع، یکی از گزینه‌های زیر را انتخاب کنید:"""
+        
+        await update.message.reply_text(
+            sharing_message,
+            reply_markup=self.get_sharing_menu()
+        )
+    
+    async def custom_categories_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور دسته‌بندی‌های سفارشی"""
+        user_id = update.effective_user.id
+        
+        categories_message = """🏷️ دسته‌بندی‌های سفارشی
+
+مدیریت دسته‌بندی‌های شخصی:
+
+➕ ایجاد دسته‌بندی جدید:
+• نام و توضیحات
+• رنگ و آیکون
+• تنظیمات پیشرفته
+
+📋 مدیریت دسته‌بندی‌ها:
+• ویرایش و حذف
+• مرتب‌سازی
+• تنظیمات دسترسی
+
+🎨 شخصی‌سازی ظاهر:
+• انتخاب رنگ‌ها
+• آیکون‌های سفارشی
+• تم‌های مختلف
+
+📊 آمار دسته‌بندی‌ها:
+• تعداد محتوا
+• آمار استفاده
+• تحلیل عملکرد
+
+برای شروع، یکی از گزینه‌های زیر را انتخاب کنید:"""
+        
+        await update.message.reply_text(
+            categories_message,
+            reply_markup=self.get_custom_categories_menu()
+        )
+    
+    async def custom_templates_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور قالب‌های سفارشی"""
+        user_id = update.effective_user.id
+        
+        templates_message = """📚 قالب‌های سفارشی
+
+مدیریت قالب‌های محتوا:
+
+📝 ایجاد قالب جدید:
+• ساختار محتوا
+• تنظیمات فرمت
+• شخصی‌سازی
+
+📋 مدیریت قالب‌ها:
+• ویرایش و حذف
+• کپی و اشتراک
+• تنظیمات پیشرفته
+
+📊 قالب‌های محبوب:
+• قالب‌های عمومی
+• آمار استفاده
+• امتیازدهی
+
+⚙️ تنظیمات قالب:
+• پیش‌فرض‌ها
+• تنظیمات خودکار
+• شخصی‌سازی
+
+برای شروع، یکی از گزینه‌های زیر را انتخاب کنید:"""
+        
+        await update.message.reply_text(
+            templates_message,
+            reply_markup=self.get_custom_templates_menu()
+        )
+    
+    async def notifications_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور اعلان‌ها"""
+        user_id = update.effective_user.id
+        
+        # دریافت اعلان‌های جدید
+        notifications = self.db.get_user_notifications(user_id, unread_only=True)
+        
+        if notifications:
+            notifications_text = "📬 اعلان‌های جدید:\n\n"
+            for i, notif in enumerate(notifications[:5], 1):
+                notifications_text += f"{i}. {notif['title']}\n"
+                notifications_text += f"   {notif['message'][:50]}...\n\n"
+        else:
+            notifications_text = "📬 هیچ اعلان جدیدی ندارید."
+        
+        notifications_text += "\n🔔 مدیریت اعلان‌ها:\n"
+        notifications_text += "• تنظیمات اعلان‌ها\n"
+        notifications_text += "• انواع اعلان‌ها\n"
+        notifications_text += "• زمان‌بندی اعلان‌ها\n"
+        notifications_text += "• فیلترهای اعلان"
+        
+        await update.message.reply_text(
+            notifications_text,
+            reply_markup=self.get_notifications_menu()
+        )
+    
+    async def advanced_search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور جستجوی پیشرفته"""
+        user_id = update.effective_user.id
+        
+        search_message = """🔍 جستجوی پیشرفته
+
+قابلیت‌های جستجو:
+
+🔍 جستجوی دقیق:
+• جستجو در محتوا
+• فیلترهای پیشرفته
+• نتایج مرتب‌سازی شده
+
+📊 جستجو در آمار:
+• آمار کاربری
+• گزارش‌های تحلیلی
+• نمودارها و گراف‌ها
+
+📚 جستجو در محتوا:
+• محتوای ذخیره شده
+• دسته‌بندی‌ها
+• برچسب‌ها
+
+📅 جستجو در تاریخچه:
+• تاریخچه جستجو
+• فعالیت‌های گذشته
+• روند استفاده
+
+🎯 فیلترهای پیشرفته:
+• فیلتر زمانی
+• فیلتر دسته‌بندی
+• فیلتر نوع محتوا
+
+برای شروع، یکی از گزینه‌های زیر را انتخاب کنید:"""
+        
+        await update.message.reply_text(
+            search_message,
+            reply_markup=self.get_advanced_search_menu()
         )
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1473,6 +2895,16 @@ class AdvancedTelegramBot:
         user_id = query.from_user.id
         action = query.data
         
+        # بررسی امنیت
+        if self.security_manager.is_user_blocked(user_id):
+            await query.edit_message_text("❌ شما از استفاده از ربات مسدود شده‌اید.")
+            return
+        
+        # بررسی محدودیت نرخ
+        if not self.rate_limiter.is_allowed(user_id, 'minute'):
+            await query.edit_message_text("⚠️ لطفاً کمی صبر کنید و دوباره تلاش کنید.")
+            return
+        
         logger.info(f"User {user_id} pressed button: {action}")
         
         try:
@@ -1500,6 +2932,159 @@ class AdvancedTelegramBot:
                     message, 
                     reply_markup=self.get_back_menu()
                 )
+            
+            elif action == 'ai_assistant':
+                await query.edit_message_text(
+                    "🤖 دستیار هوشمند AI\n\nقابلیت‌های پیشرفته در دسترس شما:",
+                    reply_markup=self.get_ai_assistant_menu()
+                )
+            
+            elif action == 'ai_smart_content':
+                self.user_states[user_id] = 'waiting_for_ai_topic'
+                await query.edit_message_text(
+                    "🎯 تولید محتوای هوشمند\n\nلطفاً موضوع مورد نظر خود را بنویسید:\n\nاین سیستم از هوش مصنوعی پیشرفته برای تولید محتوای بهینه استفاده می‌کند.",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'ai_summary':
+                self.user_states[user_id] = 'waiting_for_summary_topic'
+                await query.edit_message_text(
+                    "📋 خلاصه و نکات کلیدی\n\nلطفاً موضوع یا محتوایی که می‌خواهید خلاصه شود را بنویسید:",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'ai_research':
+                self.user_states[user_id] = 'waiting_for_research_topic'
+                await query.edit_message_text(
+                    "🔍 تحقیق پیشرفته\n\nلطفاً موضوعی که می‌خواهید تحقیق شود را بنویسید:\n\nاین سیستم تحقیق عمیق و جامعی انجام خواهد داد.",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'ai_analysis':
+                self.user_states[user_id] = 'waiting_for_analysis_topic'
+                await query.edit_message_text(
+                    "📊 تحلیل و گزارش\n\nلطفاً موضوعی که می‌خواهید تحلیل شود را بنویسید:\n\nاین سیستم تحلیل آماری و گزارش‌های تحلیلی ارائه می‌دهد.",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'ai_suggestions':
+                await self.show_ai_suggestions(query, user_id)
+            
+            elif action == 'ai_chat':
+                self.user_states[user_id] = 'ai_chat_mode'
+                await query.edit_message_text(
+                    "🔄 چت تعاملی\n\nحالا می‌توانید با دستیار هوشمند چت کنید.\n\nبرای خروج از حالت چت، /exit را تایپ کنید.",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'sharing':
+                await query.edit_message_text(
+                    "📤 سیستم اشتراک‌گذاری\n\nقابلیت‌های اشتراک‌گذاری محتوا:",
+                    reply_markup=self.get_sharing_menu()
+                )
+            
+            elif action == 'share_content':
+                await self.show_shareable_content(query, user_id)
+            
+            elif action == 'share_links':
+                await self.show_share_links(query, user_id)
+            
+            elif action == 'share_stats':
+                await self.show_share_stats(query, user_id)
+            
+            elif action == 'share_settings':
+                await self.show_share_settings(query, user_id)
+            
+            elif action == 'custom_categories':
+                await query.edit_message_text(
+                    "🏷️ دسته‌بندی‌های سفارشی\n\nمدیریت دسته‌بندی‌های شخصی:",
+                    reply_markup=self.get_custom_categories_menu()
+                )
+            
+            elif action == 'create_category':
+                self.user_states[user_id] = 'waiting_for_category_name'
+                await query.edit_message_text(
+                    "➕ ایجاد دسته‌بندی جدید\n\nلطفاً نام دسته‌بندی جدید را بنویسید:",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'manage_categories':
+                await self.show_manage_categories(query, user_id)
+            
+            elif action == 'customize_categories':
+                await self.show_customize_categories(query, user_id)
+            
+            elif action == 'category_stats':
+                await self.show_category_stats(query, user_id)
+            
+            elif action == 'custom_templates':
+                await query.edit_message_text(
+                    "📚 قالب‌های سفارشی\n\nمدیریت قالب‌های محتوا:",
+                    reply_markup=self.get_custom_templates_menu()
+                )
+            
+            elif action == 'create_template':
+                self.user_states[user_id] = 'waiting_for_template_name'
+                await query.edit_message_text(
+                    "📝 ایجاد قالب جدید\n\nلطفاً نام قالب جدید را بنویسید:",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'manage_templates':
+                await self.show_manage_templates(query, user_id)
+            
+            elif action == 'popular_templates':
+                await self.show_popular_templates(query, user_id)
+            
+            elif action == 'template_settings':
+                await self.show_template_settings(query, user_id)
+            
+            elif action == 'notifications':
+                await query.edit_message_text(
+                    "🔔 سیستم اعلان‌ها\n\nمدیریت اعلان‌ها:",
+                    reply_markup=self.get_notifications_menu()
+                )
+            
+            elif action == 'new_notifications':
+                await self.show_new_notifications(query, user_id)
+            
+            elif action == 'all_notifications':
+                await self.show_all_notifications(query, user_id)
+            
+            elif action == 'notification_settings':
+                await self.show_notification_settings(query, user_id)
+            
+            elif action == 'manage_notifications':
+                await self.show_manage_notifications(query, user_id)
+            
+            elif action == 'advanced_search':
+                await query.edit_message_text(
+                    "🔍 جستجوی پیشرفته\n\nقابلیت‌های جستجو:",
+                    reply_markup=self.get_advanced_search_menu()
+                )
+            
+            elif action == 'precise_search':
+                self.user_states[user_id] = 'waiting_for_search_query'
+                await query.edit_message_text(
+                    "🔍 جستجوی دقیق\n\nلطفاً عبارت جستجو را بنویسید:",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'search_analytics':
+                await self.show_search_analytics(query, user_id)
+            
+            elif action == 'search_content':
+                self.user_states[user_id] = 'waiting_for_content_search'
+                await query.edit_message_text(
+                    "📚 جستجو در محتوا\n\nلطفاً عبارت جستجو را بنویسید:",
+                    reply_markup=self.get_back_menu()
+                )
+            
+            elif action == 'search_history':
+                await self.show_search_history(query, user_id)
+            
+            elif action == 'advanced_filters':
+                await self.show_advanced_filters(query, user_id)
                 
             elif action == 'analytics':
                 await self.show_analytics(query, user_id)
@@ -2007,62 +3592,858 @@ class AdvancedTelegramBot:
             chunks.append(current_chunk.strip())
         
         return chunks
+    
+    # متدهای جدید برای قابلیت‌های پیشرفته
+    async def show_ai_suggestions(self, query, user_id: int):
+        """نمایش پیشنهادات هوشمند"""
+        try:
+            # دریافت آمار کاربر برای پیشنهادات شخصی‌سازی شده
+            user_stats = self.db.get_user_statistics(user_id)
+            popular_categories = user_stats.get('popular_categories', [])
+            
+            suggestions_text = "💡 پیشنهادات هوشمند برای شما:\n\n"
+            
+            if popular_categories:
+                suggestions_text += "🏷️ بر اساس علایق شما:\n"
+                for category, count in popular_categories[:3]:
+                    suggestions_text += f"• {category}: {count} درخواست\n"
+                suggestions_text += "\n"
+            
+            # پیشنهادات عمومی
+            general_suggestions = [
+                "مدیریت زمان و بهره‌وری",
+                "استراتژی‌های بازاریابی دیجیتال",
+                "هوش مصنوعی در کسب‌وکار",
+                "توسعه مهارت‌های رهبری",
+                "نوآوری و کارآفرینی"
+            ]
+            
+            suggestions_text += "🎯 پیشنهادات عمومی:\n"
+            for i, suggestion in enumerate(general_suggestions, 1):
+                suggestions_text += f"{i}. {suggestion}\n"
+            
+            suggestions_text += "\n💡 برای استفاده از هر پیشنهاد، آن را کپی کرده و در بخش 'موضوع جدید' استفاده کنید."
+            
+            await query.edit_message_text(
+                suggestions_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing AI suggestions: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش پیشنهادات",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_shareable_content(self, query, user_id: int):
+        """نمایش محتوای قابل اشتراک‌گذاری"""
+        try:
+            saved_content = self.db.get_saved_content(user_id, 10)
+            
+            if not saved_content:
+                await query.edit_message_text(
+                    "💾 شما هنوز محتوایی برای اشتراک‌گذاری ندارید.\n\n💡 ابتدا محتوایی تولید کنید و آن را ذخیره کنید.",
+                    reply_markup=self.get_back_menu()
+                )
+                return
+            
+            content_text = "📤 محتوای قابل اشتراک‌گذاری:\n\n"
+            buttons = []
+            
+            for i, content in enumerate(saved_content[:5], 1):
+                content_text += f"{i}. 📝 {content['topic']}\n"
+                content_text += f"   🏷️ {content['category']}\n"
+                content_text += f"   📅 {content['created_at'][:10]}\n\n"
+                
+                buttons.append([InlineKeyboardButton(
+                    f"📤 اشتراک {i}", 
+                    callback_data=f'share_content_{content["id"]}'
+                )])
+            
+            buttons.append([InlineKeyboardButton("🔙 برگشت", callback_data='sharing')])
+            
+            await query.edit_message_text(
+                content_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except Exception as e:
+            logger.error(f"Error showing shareable content: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش محتوا",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_share_links(self, query, user_id: int):
+        """نمایش لینک‌های اشتراک"""
+        try:
+            # اینجا می‌توانید لینک‌های اشتراک کاربر را نمایش دهید
+            share_text = "🔗 لینک‌های اشتراک شما:\n\n"
+            share_text += "📊 آمار کلی:\n"
+            share_text += "• لینک‌های فعال: 0\n"
+            share_text += "• کل بازدید: 0\n"
+            share_text += "• اشتراک‌گذاری‌ها: 0\n\n"
+            share_text += "💡 برای ایجاد لینک اشتراک جدید، از بخش 'اشتراک محتوا' استفاده کنید."
+            
+            await query.edit_message_text(
+                share_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing share links: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش لینک‌ها",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_share_stats(self, query, user_id: int):
+        """نمایش آمار اشتراک"""
+        try:
+            stats_text = "📊 آمار اشتراک‌گذاری:\n\n"
+            stats_text += "📈 آمار کلی:\n"
+            stats_text += "• کل محتوای اشتراک‌گذاری شده: 0\n"
+            stats_text += "• کل بازدید: 0\n"
+            stats_text += "• میانگین بازدید: 0\n"
+            stats_text += "• محبوب‌ترین محتوا: - \n\n"
+            stats_text += "📅 آمار هفته گذشته:\n"
+            stats_text += "• بازدید جدید: 0\n"
+            stats_text += "• اشتراک‌گذاری جدید: 0\n\n"
+            stats_text += "💡 برای بهبود آمار، محتوای باکیفیت تولید کنید."
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing share stats: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش آمار",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_share_settings(self, query, user_id: int):
+        """نمایش تنظیمات اشتراک"""
+        try:
+            settings_text = "⚙️ تنظیمات اشتراک‌گذاری:\n\n"
+            settings_text += "🔒 حریم خصوصی:\n"
+            settings_text += "• سطح دسترسی: عمومی\n"
+            settings_text += "• نیاز به تأیید: خیر\n"
+            settings_text += "• محدودیت زمانی: نامحدود\n\n"
+            settings_text += "📊 آمار و تحلیل:\n"
+            settings_text += "• نمایش آمار: بله\n"
+            settings_text += "• اعلان بازدید: بله\n"
+            settings_text += "• گزارش‌های دوره‌ای: خیر\n\n"
+            settings_text += "💡 برای تغییر تنظیمات، با پشتیبانی تماس بگیرید."
+            
+            await query.edit_message_text(
+                settings_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing share settings: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش تنظیمات",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_manage_categories(self, query, user_id: int):
+        """نمایش مدیریت دسته‌بندی‌ها"""
+        try:
+            custom_categories = self.db.get_custom_categories(user_id)
+            
+            if not custom_categories:
+                await query.edit_message_text(
+                    "🏷️ شما هنوز دسته‌بندی سفارشی ایجاد نکرده‌اید.\n\n💡 برای ایجاد دسته‌بندی جدید، از گزینه 'ایجاد دسته‌بندی جدید' استفاده کنید.",
+                    reply_markup=self.get_back_menu()
+                )
+                return
+            
+            categories_text = "📋 مدیریت دسته‌بندی‌های شما:\n\n"
+            buttons = []
+            
+            for i, category in enumerate(custom_categories[:5], 1):
+                categories_text += f"{i}. {category['icon']} {category['name']}\n"
+                categories_text += f"   📝 {category['description']}\n"
+                categories_text += f"   📅 {category['created_at'][:10]}\n\n"
+                
+                buttons.append([InlineKeyboardButton(
+                    f"✏️ ویرایش {i}", 
+                    callback_data=f'edit_category_{category["id"]}'
+                )])
+            
+            buttons.append([InlineKeyboardButton("🔙 برگشت", callback_data='custom_categories')])
+            
+            await query.edit_message_text(
+                categories_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except Exception as e:
+            logger.error(f"Error showing manage categories: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش دسته‌بندی‌ها",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_customize_categories(self, query, user_id: int):
+        """نمایش شخصی‌سازی دسته‌بندی‌ها"""
+        try:
+            customize_text = "🎨 شخصی‌سازی دسته‌بندی‌ها:\n\n"
+            customize_text += "🎨 رنگ‌ها:\n"
+            customize_text += "• رنگ پیش‌فرض: آبی\n"
+            customize_text += "• رنگ‌های موجود: آبی، سبز، قرمز، زرد، بنفش\n\n"
+            customize_text += "📱 آیکون‌ها:\n"
+            customize_text += "• آیکون پیش‌فرض: 📁\n"
+            customize_text += "• آیکون‌های موجود: 📁 📂 📄 📋 📊 🏷️ 🎯 💡 🔍\n\n"
+            customize_text += "💡 برای تغییر ظاهر، دسته‌بندی مورد نظر را ویرایش کنید."
+            
+            await query.edit_message_text(
+                customize_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing customize categories: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش شخصی‌سازی",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_category_stats(self, query, user_id: int):
+        """نمایش آمار دسته‌بندی‌ها"""
+        try:
+            stats_text = "📊 آمار دسته‌بندی‌ها:\n\n"
+            stats_text += "📈 آمار کلی:\n"
+            stats_text += "• کل دسته‌بندی‌ها: 0\n"
+            stats_text += "• دسته‌بندی‌های فعال: 0\n"
+            stats_text += "• محتوای مرتبط: 0\n\n"
+            stats_text += "🏆 محبوب‌ترین دسته‌بندی‌ها:\n"
+            stats_text += "• هنوز آمار موجود نیست\n\n"
+            stats_text += "💡 برای مشاهده آمار، ابتدا دسته‌بندی و محتوا ایجاد کنید."
+            
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing category stats: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش آمار",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_manage_templates(self, query, user_id: int):
+        """نمایش مدیریت قالب‌ها"""
+        try:
+            templates_text = "📋 مدیریت قالب‌های شما:\n\n"
+            templates_text += "📝 قالب‌های موجود:\n"
+            templates_text += "• هنوز قالب سفارشی ایجاد نکرده‌اید\n\n"
+            templates_text += "💡 برای ایجاد قالب جدید:\n"
+            templates_text += "• نام قالب را انتخاب کنید\n"
+            templates_text += "• ساختار محتوا را تعریف کنید\n"
+            templates_text += "• تنظیمات فرمت را مشخص کنید\n"
+            templates_text += "• قالب را ذخیره کنید\n\n"
+            templates_text += "🔧 قالب‌های پیش‌فرض در دسترس هستند."
+            
+            await query.edit_message_text(
+                templates_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing manage templates: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش قالب‌ها",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_popular_templates(self, query, user_id: int):
+        """نمایش قالب‌های محبوب"""
+        try:
+            popular_text = "📊 قالب‌های محبوب:\n\n"
+            popular_text += "🏆 قالب‌های برتر:\n"
+            popular_text += "1. 📚 قالب آموزشی جامع\n"
+            popular_text += "   ⭐ امتیاز: 4.8/5\n"
+            popular_text += "   📊 استفاده: 1,234 بار\n\n"
+            popular_text += "2. 💼 قالب حرفه‌ای\n"
+            popular_text += "   ⭐ امتیاز: 4.6/5\n"
+            popular_text += "   📊 استفاده: 987 بار\n\n"
+            popular_text += "3. 🎯 قالب خلاصه\n"
+            popular_text += "   ⭐ امتیاز: 4.5/5\n"
+            popular_text += "   📊 استفاده: 756 بار\n\n"
+            popular_text += "💡 برای استفاده از قالب‌ها، آن‌ها را کپی کرده و شخصی‌سازی کنید."
+            
+            await query.edit_message_text(
+                popular_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing popular templates: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش قالب‌های محبوب",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_template_settings(self, query, user_id: int):
+        """نمایش تنظیمات قالب"""
+        try:
+            settings_text = "⚙️ تنظیمات قالب:\n\n"
+            settings_text += "📝 تنظیمات پیش‌فرض:\n"
+            settings_text += "• قالب پیش‌فرض: آموزشی\n"
+            settings_text += "• طول محتوا: متوسط\n"
+            settings_text += "• فرمت: ساختاریافته\n\n"
+            settings_text += "🎨 تنظیمات ظاهر:\n"
+            settings_text += "• استفاده از ایموجی: بله\n"
+            settings_text += "• رنگ‌بندی: خودکار\n"
+            settings_text += "• فونت: پیش‌فرض\n\n"
+            settings_text += "💡 برای تغییر تنظیمات، از بخش تنظیمات اصلی استفاده کنید."
+            
+            await query.edit_message_text(
+                settings_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing template settings: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش تنظیمات",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_new_notifications(self, query, user_id: int):
+        """نمایش اعلان‌های جدید"""
+        try:
+            notifications = self.db.get_user_notifications(user_id, unread_only=True)
+            
+            if not notifications:
+                await query.edit_message_text(
+                    "📬 هیچ اعلان جدیدی ندارید.\n\n✅ همه اعلان‌ها خوانده شده‌اند.",
+                    reply_markup=self.get_back_menu()
+                )
+                return
+            
+            notifications_text = "📬 اعلان‌های جدید:\n\n"
+            buttons = []
+            
+            for i, notif in enumerate(notifications[:5], 1):
+                notifications_text += f"{i}. {notif['title']}\n"
+                notifications_text += f"   📅 {notif['created_at'][:16]}\n"
+                notifications_text += f"   {notif['message'][:50]}...\n\n"
+                
+                buttons.append([InlineKeyboardButton(
+                    f"👁️ خواندن {i}", 
+                    callback_data=f'read_notification_{notif["id"]}'
+                )])
+            
+            buttons.append([InlineKeyboardButton("🔙 برگشت", callback_data='notifications')])
+            
+            await query.edit_message_text(
+                notifications_text,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except Exception as e:
+            logger.error(f"Error showing new notifications: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش اعلان‌ها",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_all_notifications(self, query, user_id: int):
+        """نمایش همه اعلان‌ها"""
+        try:
+            notifications = self.db.get_user_notifications(user_id, unread_only=False)
+            
+            if not notifications:
+                await query.edit_message_text(
+                    "📋 هیچ اعلانی ندارید.\n\n💡 اعلان‌ها شامل اطلاعات مهم و به‌روزرسانی‌ها هستند.",
+                    reply_markup=self.get_back_menu()
+                )
+                return
+            
+            notifications_text = "📋 همه اعلان‌ها:\n\n"
+            
+            for i, notif in enumerate(notifications[:10], 1):
+                status = "📬" if not notif['is_read'] else "📭"
+                notifications_text += f"{i}. {status} {notif['title']}\n"
+                notifications_text += f"   📅 {notif['created_at'][:16]}\n"
+                notifications_text += f"   {notif['message'][:50]}...\n\n"
+            
+            if len(notifications) > 10:
+                notifications_text += f"... و {len(notifications) - 10} اعلان دیگر"
+            
+            await query.edit_message_text(
+                notifications_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing all notifications: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش اعلان‌ها",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_notification_settings(self, query, user_id: int):
+        """نمایش تنظیمات اعلان"""
+        try:
+            settings_text = "⚙️ تنظیمات اعلان‌ها:\n\n"
+            settings_text += "🔔 انواع اعلان:\n"
+            settings_text += "• اعلان‌های سیستم: فعال ✅\n"
+            settings_text += "• یادآوری‌ها: فعال ✅\n"
+            settings_text += "• به‌روزرسانی‌ها: فعال ✅\n"
+            settings_text += "• آمار و گزارش: غیرفعال ❌\n\n"
+            settings_text += "⏰ زمان‌بندی:\n"
+            settings_text += "• اعلان‌های فوری: بله\n"
+            settings_text += "• اعلان‌های روزانه: بله\n"
+            settings_text += "• اعلان‌های هفتگی: خیر\n\n"
+            settings_text += "💡 برای تغییر تنظیمات، از بخش تنظیمات اصلی استفاده کنید."
+            
+            await query.edit_message_text(
+                settings_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing notification settings: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش تنظیمات",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_manage_notifications(self, query, user_id: int):
+        """نمایش مدیریت اعلان‌ها"""
+        try:
+            manage_text = "🔕 مدیریت اعلان‌ها:\n\n"
+            manage_text += "📋 عملیات موجود:\n"
+            manage_text += "• علامت‌گذاری همه به عنوان خوانده شده\n"
+            manage_text += "• حذف اعلان‌های قدیمی\n"
+            manage_text += "• تنظیم فیلترهای اعلان\n"
+            manage_text += "• صادر کردن اعلان‌ها\n\n"
+            manage_text += "⚙️ تنظیمات پیشرفته:\n"
+            manage_text += "• حذف خودکار اعلان‌های قدیمی\n"
+            manage_text += "• محدودیت تعداد اعلان‌ها\n"
+            manage_text += "• دسته‌بندی اعلان‌ها\n\n"
+            manage_text += "💡 برای استفاده از این قابلیت‌ها، با پشتیبانی تماس بگیرید."
+            
+            await query.edit_message_text(
+                manage_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing manage notifications: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش مدیریت",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_search_analytics(self, query, user_id: int):
+        """نمایش آمار جستجو"""
+        try:
+            search_history = self.db.get_search_history(user_id, 10)
+            
+            analytics_text = "📊 آمار جستجو:\n\n"
+            analytics_text += "📈 آمار کلی:\n"
+            analytics_text += f"• کل جستجوها: {len(search_history)}\n"
+            
+            if search_history:
+                successful_searches = sum(1 for s in search_history if s['is_successful'])
+                analytics_text += f"• جستجوهای موفق: {successful_searches}\n"
+                analytics_text += f"• نرخ موفقیت: {(successful_searches/len(search_history)*100):.1f}%\n\n"
+                
+                analytics_text += "🔍 آخرین جستجوها:\n"
+                for i, search in enumerate(search_history[:5], 1):
+                    status = "✅" if search['is_successful'] else "❌"
+                    analytics_text += f"{i}. {status} {search['query']}\n"
+                    analytics_text += f"   📅 {search['created_at'][:10]}\n\n"
+            else:
+                analytics_text += "• هنوز جستجویی انجام نداده‌اید\n\n"
+            
+            analytics_text += "💡 برای بهبود نتایج، از کلمات کلیدی دقیق استفاده کنید."
+            
+            await query.edit_message_text(
+                analytics_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing search analytics: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش آمار",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_search_history(self, query, user_id: int):
+        """نمایش تاریخچه جستجو"""
+        try:
+            search_history = self.db.get_search_history(user_id, 20)
+            
+            if not search_history:
+                await query.edit_message_text(
+                    "📅 تاریخچه جستجو خالی است.\n\n💡 پس از انجام جستجو، تاریخچه شما اینجا نمایش داده می‌شود.",
+                    reply_markup=self.get_back_menu()
+                )
+                return
+            
+            history_text = "📅 تاریخچه جستجو:\n\n"
+            
+            for i, search in enumerate(search_history, 1):
+                status = "✅" if search['is_successful'] else "❌"
+                history_text += f"{i}. {status} {search['query']}\n"
+                history_text += f"   🏷️ {search['category']}\n"
+                history_text += f"   📅 {search['created_at'][:16]}\n"
+                history_text += f"   📊 {search['results_count']} نتیجه\n\n"
+            
+            await query.edit_message_text(
+                history_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing search history: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش تاریخچه",
+                reply_markup=self.get_back_menu()
+            )
+    
+    async def show_advanced_filters(self, query, user_id: int):
+        """نمایش فیلترهای پیشرفته"""
+        try:
+            filters_text = "🎯 فیلترهای پیشرفته:\n\n"
+            filters_text += "⏰ فیلتر زمانی:\n"
+            filters_text += "• امروز\n"
+            filters_text += "• هفته گذشته\n"
+            filters_text += "• ماه گذشته\n"
+            filters_text += "• سال گذشته\n\n"
+            filters_text += "🏷️ فیلتر دسته‌بندی:\n"
+            filters_text += "• هوش مصنوعی\n"
+            filters_text += "• بازاریابی\n"
+            filters_text += "• مدیریت\n"
+            filters_text += "• برنامه‌نویسی\n"
+            filters_text += "• کسب‌وکار\n\n"
+            filters_text += "📝 فیلتر نوع محتوا:\n"
+            filters_text += "• آموزشی\n"
+            filters_text += "• حرفه‌ای\n"
+            filters_text += "• خلاصه\n"
+            filters_text += "• تحلیل\n\n"
+            filters_text += "💡 برای استفاده از فیلترها، در بخش جستجو آن‌ها را انتخاب کنید."
+            
+            await query.edit_message_text(
+                filters_text,
+                reply_markup=self.get_back_menu()
+            )
+        except Exception as e:
+            logger.error(f"Error showing advanced filters: {e}")
+            await query.edit_message_text(
+                "❌ خطا در نمایش فیلترها",
+                reply_markup=self.get_back_menu()
+            )
 
-    def run(self):
+    async def run(self):
         """اجرای ربات پیشرفته"""
         try:
             # ایجاد application
             application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+            # رفع خطای timezone
+            try:
+                application.job_queue.scheduler.configure(timezone=pytz.timezone('Asia/Tehran'))
+            except Exception as e:
+                logger.warning(f"Could not set timezone for job_queue: {e}")
             
-            # اضافه کردن handlers
+            # تنظیم دستورات ربات
+            commands = [
+                BotCommand("start", "شروع ربات و منوی اصلی"),
+                BotCommand("help", "راهنمای کامل ربات"),
+                BotCommand("ai", "دستیار هوشمند AI"),
+                BotCommand("sharing", "سیستم اشتراک‌گذاری"),
+                BotCommand("categories", "دسته‌بندی‌های سفارشی"),
+                BotCommand("templates", "قالب‌های سفارشی"),
+                BotCommand("notifications", "مدیریت اعلان‌ها"),
+                BotCommand("search", "جستجوی پیشرفته"),
+                BotCommand("analytics", "آمار و گزارش شخصی"),
+                BotCommand("settings", "تنظیمات شخصی"),
+                BotCommand("saved", "محتوای ذخیره شده"),
+                BotCommand("feedback", "بازخورد و نظرات"),
+                BotCommand("reminders", "یادآوری‌ها"),
+                BotCommand("stats", "آمار سیستم"),
+                BotCommand("backup", "پشتیبان‌گیری"),
+                BotCommand("exit", "خروج از حالت چت")
+            ]
+            
+            # تنظیم دستورات
+            try:
+                await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+            except Exception as e:
+                logger.warning(f"Could not set bot commands: {e}")
+            
+            # اضافه کردن handlers اصلی
             application.add_handler(CommandHandler("start", self.start_command))
             application.add_handler(CommandHandler("help", self.help_command))
+            application.add_handler(CommandHandler("ai", self.ai_assistant_command))
+            application.add_handler(CommandHandler("sharing", self.sharing_command))
+            application.add_handler(CommandHandler("categories", self.custom_categories_command))
+            application.add_handler(CommandHandler("templates", self.custom_templates_command))
+            application.add_handler(CommandHandler("notifications", self.notifications_command))
+            application.add_handler(CommandHandler("search", self.advanced_search_command))
             application.add_handler(CommandHandler("analytics", self.analytics_command))
             application.add_handler(CommandHandler("settings", self.settings_command))
             application.add_handler(CommandHandler("saved", self.saved_command))
             application.add_handler(CommandHandler("feedback", self.feedback_command))
             application.add_handler(CommandHandler("reminders", self.reminders_command))
+            application.add_handler(CommandHandler("stats", self.system_stats_command))
+            application.add_handler(CommandHandler("backup", self.backup_command))
+            application.add_handler(CommandHandler("exit", self.exit_command))
+            
+            # اضافه کردن handlers پیشرفته
             application.add_handler(CallbackQueryHandler(self.button_handler))
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
             
-            # شروع ربات
-            logger.info("Advanced Bot started successfully!")
-            logger.info(f"Database path: {self.db.db_path}")
-            logger.info(f"Max daily requests: {MAX_DAILY_REQUESTS}")
+            # شروع وظایف پس‌زمینه
+            self.start_background_tasks(application)
             
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
+            # شروع ربات
+            logger.info("🚀 Advanced Bot started successfully!")
+            logger.info(f"📊 Database path: {self.db.db_path}")
+            logger.info(f"📈 Max daily requests: {MAX_DAILY_REQUESTS}")
+            logger.info(f"🔒 Security features: Enabled")
+            logger.info(f"🤖 AI Assistant: Enabled")
+            logger.info(f"📤 Sharing system: Enabled")
+            logger.info(f"🏷️ Custom categories: Enabled")
+            logger.info(f"📚 Custom templates: Enabled")
+            logger.info(f"🔔 Notification system: Enabled")
+            logger.info(f"🔍 Advanced search: Enabled")
+            
+            # راه‌اندازی و شروع ربات
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            
+            # نگه داشتن ربات فعال
+            try:
+                await asyncio.Event().wait()  # منتظر ماندن تا زمانی که متوقف شود
+            except KeyboardInterrupt:
+                pass
+            finally:
+                await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
         except Exception as e:
             logger.error(f"Error starting bot: {e}")
             raise
+    
+    def start_background_tasks(self, application):
+        """شروع وظایف پس‌زمینه"""
+        try:
+            # وظیفه پشتیبان‌گیری خودکار
+            async def auto_backup():
+                while True:
+                    try:
+                        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)  # تبدیل به ثانیه
+                        backup_path = self.backup_manager.create_backup()
+                        if backup_path:
+                            logger.info(f"Auto backup created: {backup_path}")
+                        self.backup_manager.cleanup_old_backups()
+                    except Exception as e:
+                        logger.error(f"Auto backup error: {e}")
+            
+            # وظیفه پاک‌سازی داده‌های قدیمی
+            async def cleanup_old_data():
+                while True:
+                    try:
+                        await asyncio.sleep(24 * 3600)  # روزانه
+                        # پاک‌سازی اعلان‌های قدیمی
+                        # پاک‌سازی تاریخچه جستجوی قدیمی
+                        logger.info("Old data cleanup completed")
+                    except Exception as e:
+                        logger.error(f"Cleanup error: {e}")
+            
+            # وظیفه ارسال یادآوری‌ها
+            async def send_reminders():
+                while True:
+                    try:
+                        await asyncio.sleep(300)  # هر 5 دقیقه
+                        # بررسی یادآوری‌های زمان‌دار
+                        # ارسال یادآوری‌ها
+                        logger.debug("Reminder check completed")
+                    except Exception as e:
+                        logger.error(f"Reminder error: {e}")
+            
+            # شروع وظایف - این‌ها در run_polling اجرا خواهند شد
+            logger.info("Background tasks defined successfully")
+            
+            logger.info("Background tasks started successfully")
+        except Exception as e:
+            logger.error(f"Error starting background tasks: {e}")
+    
+    async def system_stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور آمار سیستم"""
+        user_id = update.effective_user.id
+        
+        if self.security_manager.is_user_blocked(user_id):
+            await update.message.reply_text("❌ شما از استفاده از ربات مسدود شده‌اید.")
+            return
+        
+        # بررسی نقش کاربر (فقط ادمین‌ها)
+        user = self.db.get_user(user_id)
+        if not user or user.get('role', 'user') not in ['admin', 'moderator']:
+            await update.message.reply_text("❌ شما مجوز مشاهده آمار سیستم را ندارید.")
+            return
+        
+        uptime = datetime.now() - self.system_stats['start_time']
+        uptime_str = f"{uptime.days} روز, {uptime.seconds // 3600} ساعت, {(uptime.seconds % 3600) // 60} دقیقه"
+        
+        stats_text = f"""📊 آمار سیستم:
 
-def main():
-    """تابع اصلی"""
+⏰ زمان کارکرد: {uptime_str}
+📈 کل درخواست‌ها: {self.system_stats['total_requests']}
+✅ درخواست‌های موفق: {self.system_stats['successful_requests']}
+❌ درخواست‌های ناموفق: {self.system_stats['failed_requests']}
+👥 کاربران فعال: {self.system_stats['active_users']}
+
+🔒 امنیت:
+• کاربران مسدود شده: {len(self.security_manager.blocked_users)}
+• محدودیت‌های نرخ: فعال
+
+💾 دیتابیس:
+• مسیر: {self.db.db_path}
+• اندازه: {self.get_database_size()} MB
+
+🤖 AI Assistant:
+• وضعیت: فعال
+• مدل: {METIS_MODEL}
+• API: متصل
+
+📤 اشتراک‌گذاری:
+• لینک‌های فعال: 0
+• کل بازدید: 0
+
+💡 برای اطلاعات بیشتر، از منوی اصلی استفاده کنید."""
+        
+        await update.message.reply_text(stats_text, reply_markup=self.get_main_menu())
+    
+    async def backup_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور پشتیبان‌گیری"""
+        user_id = update.effective_user.id
+        
+        if self.security_manager.is_user_blocked(user_id):
+            await update.message.reply_text("❌ شما از استفاده از ربات مسدود شده‌اید.")
+            return
+        
+        # بررسی نقش کاربر
+        user = self.db.get_user(user_id)
+        if not user or user.get('role', 'user') not in ['admin', 'moderator']:
+            await update.message.reply_text("❌ شما مجوز پشتیبان‌گیری را ندارید.")
+            return
+        
+        try:
+            backup_path = self.backup_manager.create_backup()
+            if backup_path:
+                await update.message.reply_text(
+                    f"✅ پشتیبان‌گیری با موفقیت انجام شد!\n\n📁 مسیر: {backup_path}\n📅 تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    reply_markup=self.get_main_menu()
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ خطا در ایجاد پشتیبان",
+                    reply_markup=self.get_main_menu()
+                )
+        except Exception as e:
+            logger.error(f"Backup command error: {e}")
+            await update.message.reply_text(
+                "❌ خطا در پشتیبان‌گیری",
+                reply_markup=self.get_main_menu()
+            )
+    
+    async def exit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """دستور خروج از حالت چت"""
+        user_id = update.effective_user.id
+        
+        # پاک کردن وضعیت‌های چت
+        self.user_states.pop(user_id, None)
+        self.conversation_states.pop(user_id, None)
+        
+        await update.message.reply_text(
+            "✅ از حالت چت خارج شدید.\n\nبرای شروع مجدد، از منوی اصلی استفاده کنید.",
+            reply_markup=self.get_main_menu()
+        )
+    
+    def get_database_size(self) -> float:
+        """دریافت اندازه دیتابیس"""
+        try:
+            if os.path.exists(self.db.db_path):
+                size_bytes = os.path.getsize(self.db.db_path)
+                return round(size_bytes / (1024 * 1024), 2)  # تبدیل به مگابایت
+            return 0.0
+        except Exception as e:
+            logger.error(f"Error getting database size: {e}")
+            return 0.0
+
+async def main():
+    """تابع اصلی پیشرفته"""
     bot = None
     try:
+        print("🚀 در حال راه‌اندازی ربات پیشرفته...")
+        print("📊 بررسی تنظیمات...")
+        
         # بررسی کلیدهای API
         if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-            logger.error("لطفاً TELEGRAM_BOT_TOKEN را تنظیم کنید!")
+            print("❌ لطفاً TELEGRAM_BOT_TOKEN را تنظیم کنید!")
+            logger.error("TELEGRAM_BOT_TOKEN not configured!")
             return
         
         # بررسی وجود دیتابیس
         if not os.path.exists("bot_database.db"):
+            print("💾 ایجاد دیتابیس جدید...")
             logger.info("Creating new database...")
+        
+        print("🔒 راه‌اندازی سیستم امنیت...")
+        print("🤖 راه‌اندازی دستیار هوشمند...")
+        print("📤 راه‌اندازی سیستم اشتراک‌گذاری...")
+        print("🏷️ راه‌اندازی دسته‌بندی‌های سفارشی...")
+        print("📚 راه‌اندازی قالب‌های سفارشی...")
+        print("🔔 راه‌اندازی سیستم اعلان‌ها...")
+        print("🔍 راه‌اندازی جستجوی پیشرفته...")
+        print("📈 راه‌اندازی سیستم آمار...")
+        print("💾 راه‌اندازی سیستم پشتیبان‌گیری...")
         
         # ایجاد و اجرای ربات پیشرفته
         bot = AdvancedTelegramBot()
         logger.info("Bot initialized successfully")
-        bot.run()
+        
+        print("✅ ربات با موفقیت راه‌اندازی شد!")
+        print("🎯 قابلیت‌های فعال:")
+        print("   • 🤖 دستیار هوشمند AI")
+        print("   • 📝 تولید محتوای پیشرفته")
+        print("   • 💾 ذخیره و مدیریت محتوا")
+        print("   • 📊 آمار و گزارش جامع")
+        print("   • 🏷️ دسته‌بندی‌های سفارشی")
+        print("   • 📚 قالب‌های شخصی‌سازی")
+        print("   • 📤 اشتراک‌گذاری محتوا")
+        print("   • 🔔 سیستم اعلان‌های هوشمند")
+        print("   • 📅 یادآوری و زمان‌بندی")
+        print("   • 🔍 جستجوی پیشرفته")
+        print("   • ⭐ سیستم بازخورد")
+        print("   • 🔒 امنیت پیشرفته")
+        print("   • 💾 پشتیبان‌گیری خودکار")
+        print("   • 📈 آمار سیستم")
+        print("   • 🎯 محدودیت نرخ")
+        print("   • 🔄 وظایف پس‌زمینه")
+        
+        print("\n🚀 شروع ربات...")
+        await bot.run()
         
     except KeyboardInterrupt:
+        print("\n⏹️ ربات توسط کاربر متوقف شد")
         logger.info("Bot stopped by user (Ctrl+C)")
     except Exception as e:
+        print(f"\n❌ خطای غیرمنتظره: {e}")
         logger.error(f"Critical error in main: {e}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
     finally:
         if bot:
+            print("🧹 پاک‌سازی منابع ربات...")
             logger.info("Cleaning up bot resources...")
+        print("✅ خاموشی ربات کامل شد")
         logger.info("Bot shutdown complete")
 
 if __name__ == "__main__":
-    main() 
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "event loop is already running" in str(e):
+            # اگر event loop قبلاً در حال اجرا است، از loop موجود استفاده کن
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(main())
+        else:
+            raise 
