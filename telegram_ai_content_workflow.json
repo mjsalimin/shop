@@ -3,28 +3,22 @@
   "nodes": [
     {
       "parameters": {
-        "updates": [
-          "message"
-        ]
+        "path": "metis-bot",
+        "httpMethod": "POST",
+        "responseMode": "onReceived"
       },
       "id": 1,
-      "name": "Telegram Trigger",
-      "type": "n8n-nodes-base.telegramTrigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
       "typeVersion": 1,
       "position": [
         200,
         300
-      ],
-      "credentials": {
-        "telegramApi": {
-          "id": "1",
-          "name": "Telegram Account"
-        }
-      }
+      ]
     },
     {
       "parameters": {
-        "functionCode": "const text = $json.message.text || '';\nconst prompt = `موضوع: ${text}\n\nلطفاً محتوای علمی و کاربردی در دو بخش تولید کن:\n[بخش اول] معرفی و مفاهیم\n[بخش دوم] کاربردهای عملی و نکات کلیدی`;\nreturn [{ json: { prompt, chatId: $json.message.chat.id } }];"
+        "functionCode": "const body = $json.body || {};\nconst text = body.message?.text || body.text || '';\nconst chatId = body.message?.chat?.id || body.chat_id || '';\nconst prompt = `موضوع: ${text}\n\nلطفاً محتوای علمی و کاربردی در دو بخش تولید کن:\n[بخش اول] معرفی و مفاهیم\n[بخش دوم] کاربردهای عملی و نکات کلیدی`;\nreturn [{ json: { prompt, chatId } }];"
       },
       "id": 6,
       "name": "Prepare Prompt",
@@ -41,7 +35,8 @@
         "method": "POST",
         "jsonParameters": true,
         "options": {},
-        "bodyParametersJson": "{\n  \"botId\": \"30f054f0-2363-4128-b6c6-308efc31c5d9\",\n  \"title\": \"Telegram Content\"\n}"
+        "bodyParametersJson": "{\n  \"botId\": \"30f054f0-2363-4128-b6c6-308efc31c5d9\",\n  \"title\": \"Telegram Content\"\n}",
+        "headerParametersJson": "{\n  \"Authorization\": \"Bearer tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm\"\n}"
       },
       "id": 2,
       "name": "Create Conversation",
@@ -51,12 +46,7 @@
         600,
         300
       ],
-      "credentials": {
-        "httpBasicAuth": {
-          "id": "2",
-          "name": "Metis API"
-        }
-      }
+      "credentials": {}
     },
     {
       "parameters": {
@@ -64,7 +54,8 @@
         "method": "POST",
         "jsonParameters": true,
         "options": {},
-        "bodyParametersJson": "{\n  \"content\": \"={{$node[\\\"Prepare Prompt\\\"].json[\\\"prompt\\\"]}}\",\n  \"role\": \"user\"\n}"
+        "bodyParametersJson": "{\n  \"content\": \"={{$node[\\\"Prepare Prompt\\\"].json[\\\"prompt\\\"]}}\",\n  \"role\": \"user\"\n}",
+        "headerParametersJson": "{\n  \"Authorization\": \"Bearer tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm\"\n}"
       },
       "id": 3,
       "name": "Send Message",
@@ -74,19 +65,15 @@
         800,
         300
       ],
-      "credentials": {
-        "httpBasicAuth": {
-          "id": "2",
-          "name": "Metis API"
-        }
-      }
+      "credentials": {}
     },
     {
       "parameters": {
         "url": "={{\"https://api.metisai.ir/api/conversations/\" + $node[\"Create Conversation\"].json[\"id\"] + \"/messages/\" + $node[\"Send Message\"].json[\"id\"] + \"/response\"}}",
         "method": "GET",
         "jsonParameters": false,
-        "options": {}
+        "options": {},
+        "headerParametersJson": "{\n  \"Authorization\": \"Bearer tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm\"\n}"
       },
       "id": 4,
       "name": "Get Response",
@@ -96,36 +83,24 @@
         1000,
         300
       ],
-      "credentials": {
-        "httpBasicAuth": {
-          "id": "2",
-          "name": "Metis API"
-        }
-      }
+      "credentials": {}
     },
     {
       "parameters": {
-        "chatId": "={{$node[\"Prepare Prompt\"].json[\"chatId\"]}}",
-        "text": "={{$node[\"Get Response\"].json[\"content\"]}}"
+        "responseData": "={{$node[\"Get Response\"].json[\"content\"]}}"
       },
       "id": 5,
-      "name": "Send Reply",
-      "type": "n8n-nodes-base.telegram",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.webhookResponse",
       "typeVersion": 1,
       "position": [
         1200,
         300
-      ],
-      "credentials": {
-        "telegramApi": {
-          "id": "1",
-          "name": "Telegram Account"
-        }
-      }
+      ]
     }
   ],
   "connections": {
-    "Telegram Trigger": {
+    "Webhook": {
       "main": [
         [
           {
@@ -173,7 +148,7 @@
       "main": [
         [
           {
-            "node": "Send Reply",
+            "node": "Webhook Response",
             "type": "main",
             "index": 0
           }
