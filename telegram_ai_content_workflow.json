@@ -24,6 +24,19 @@
     },
     {
       "parameters": {
+        "functionCode": "const text = $json.message.text || '';\nconst prompt = `موضوع: ${text}\n\nلطفاً محتوای علمی و کاربردی در دو بخش تولید کن:\n[بخش اول] معرفی و مفاهیم\n[بخش دوم] کاربردهای عملی و نکات کلیدی`;\nreturn [{ json: { prompt, chatId: $json.message.chat.id } }];"
+      },
+      "id": 6,
+      "name": "Prepare Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
+      "parameters": {
         "url": "https://api.metisai.ir/api/conversations",
         "method": "POST",
         "jsonParameters": true,
@@ -35,7 +48,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 1,
       "position": [
-        400,
+        600,
         300
       ],
       "credentials": {
@@ -51,14 +64,14 @@
         "method": "POST",
         "jsonParameters": true,
         "options": {},
-        "bodyParametersJson": "{\n  \"content\": \"={{$node[\\\"Telegram Trigger\\\"].json[\\\"message\\\"][\\\"text\\\"]}}\",\n  \"role\": \"user\"\n}"
+        "bodyParametersJson": "{\n  \"content\": \"={{$node[\\\"Prepare Prompt\\\"].json[\\\"prompt\\\"]}}\",\n  \"role\": \"user\"\n}"
       },
       "id": 3,
       "name": "Send Message",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 1,
       "position": [
-        600,
+        800,
         300
       ],
       "credentials": {
@@ -80,7 +93,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 1,
       "position": [
-        800,
+        1000,
         300
       ],
       "credentials": {
@@ -92,7 +105,7 @@
     },
     {
       "parameters": {
-        "chatId": "={{$node[\"Telegram Trigger\"].json[\"message\"].chat.id}}",
+        "chatId": "={{$node[\"Prepare Prompt\"].json[\"chatId\"]}}",
         "text": "={{$node[\"Get Response\"].json[\"content\"]}}"
       },
       "id": 5,
@@ -100,7 +113,7 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1,
       "position": [
-        1000,
+        1200,
         300
       ],
       "credentials": {
@@ -113,6 +126,17 @@
   ],
   "connections": {
     "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Prompt": {
       "main": [
         [
           {
