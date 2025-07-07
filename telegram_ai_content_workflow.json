@@ -1,0 +1,159 @@
+{
+  "name": "Telegram AI Content Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "metis-bot",
+        "httpMethod": "POST",
+        "responseMode": "onReceived"
+      },
+      "id": 1,
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const body = $json.body || {};\nconst text = body.message?.text || body.text || '';\nconst chatId = body.message?.chat?.id || body.chat_id || '';\nconst prompt = `موضوع: ${text}\n\nلطفاً محتوای علمی و کاربردی در دو بخش تولید کن:\n[بخش اول] معرفی و مفاهیم\n[بخش دوم] کاربردهای عملی و نکات کلیدی`;\nreturn [{ json: { prompt, chatId } }];"
+      },
+      "id": 6,
+      "name": "Prepare Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.metisai.ir/api/conversations",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\n  \"botId\": \"30f054f0-2363-4128-b6c6-308efc31c5d9\",\n  \"title\": \"Telegram Content\"\n}",
+        "headerParametersJson": "{\n  \"Authorization\": \"Bearer tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm\"\n}"
+      },
+      "id": 2,
+      "name": "Create Conversation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        600,
+        300
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "url": "={{\"https://api.metisai.ir/api/conversations/\" + $node[\"Create Conversation\"].json[\"id\"] + \"/messages\"}}",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\n  \"content\": \"={{$node[\\\"Prepare Prompt\\\"].json[\\\"prompt\\\"]}}\",\n  \"role\": \"user\"\n}",
+        "headerParametersJson": "{\n  \"Authorization\": \"Bearer tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm\"\n}"
+      },
+      "id": 3,
+      "name": "Send Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        800,
+        300
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "url": "={{\"https://api.metisai.ir/api/conversations/\" + $node[\"Create Conversation\"].json[\"id\"] + \"/messages/\" + $node[\"Send Message\"].json[\"id\"] + \"/response\"}}",
+        "method": "GET",
+        "jsonParameters": false,
+        "options": {},
+        "headerParametersJson": "{\n  \"Authorization\": \"Bearer tpsg-6WW8eb5cZfq6fZru3B6tUbSaKB2EkVm\"\n}"
+      },
+      "id": 4,
+      "name": "Get Response",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        300
+      ],
+      "credentials": {}
+    },
+    {
+      "parameters": {
+        "responseData": "={{$node[\"Get Response\"].json[\"content\"]}}"
+      },
+      "id": 5,
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.webhookResponse",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Prepare Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Prompt": {
+      "main": [
+        [
+          {
+            "node": "Create Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Conversation": {
+      "main": [
+        [
+          {
+            "node": "Send Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Message": {
+      "main": [
+        [
+          {
+            "node": "Get Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Response": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
