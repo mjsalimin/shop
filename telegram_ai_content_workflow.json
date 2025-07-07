@@ -1,0 +1,160 @@
+{
+  "name": "Telegram AI Content Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ]
+      },
+      "id": 1,
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://api.metisai.ir/api/conversations",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\n  \"botId\": \"30f054f0-2363-4128-b6c6-308efc31c5d9\",\n  \"title\": \"Telegram Content\"\n}"
+      },
+      "id": 2,
+      "name": "Create Conversation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        400,
+        300
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "2",
+          "name": "Metis API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{\"https://api.metisai.ir/api/conversations/\" + $node[\"Create Conversation\"].json[\"id\"] + \"/messages\"}}",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "{\n  \"content\": \"={{$node[\\\"Telegram Trigger\\\"].json[\\\"message\\\"][\\\"text\\\"]}}\",\n  \"role\": \"user\"\n}"
+      },
+      "id": 3,
+      "name": "Send Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        600,
+        300
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "2",
+          "name": "Metis API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{\"https://api.metisai.ir/api/conversations/\" + $node[\"Create Conversation\"].json[\"id\"] + \"/messages/\" + $node[\"Send Message\"].json[\"id\"] + \"/response\"}}",
+        "method": "GET",
+        "jsonParameters": false,
+        "options": {}
+      },
+      "id": 4,
+      "name": "Get Response",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        800,
+        300
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "2",
+          "name": "Metis API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{$node[\"Telegram Trigger\"].json[\"message\"].chat.id}}",
+        "text": "={{$node[\"Get Response\"].json[\"content\"]}}"
+      },
+      "id": 5,
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "1",
+          "name": "Telegram Account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Create Conversation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Conversation": {
+      "main": [
+        [
+          {
+            "node": "Send Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Message": {
+      "main": [
+        [
+          {
+            "node": "Get Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Response": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
